@@ -1,0 +1,1 @@
+ALTER TABLE "legacy_adapter_transports" ADD COLUMN "prepared_finalization_json" jsonb;

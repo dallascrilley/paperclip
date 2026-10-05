@@ -1,3 +1,4 @@
+import { prepareLegacyAdapterFinalizationInputs, type LegacyAdapterFinalizationInputs } from "./legacy-adapter-finalization-inputs.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { AdapterExecutionContext, AdapterInvocationMeta, AdapterRuntimeEvent, RuntimeStatusSink } from "@paperclipai/adapter-utils";
@@ -20,6 +21,7 @@ export async function executeSupervisedLegacyAdapter(input: {
   context: AdapterExecutionContext;
   secretValues: string[];
   workerEnv?: NodeJS.ProcessEnv;
+  preparedFinalization: LegacyAdapterFinalizationInputs;
   assertOwned: () => Promise<void>;
   cancellationRequested: () => Promise<boolean>;
   project: (event: LegacyAdapterWorkerEvent) => Pick<AppendHeartbeatRunEventInput,
@@ -32,7 +34,8 @@ export async function executeSupervisedLegacyAdapter(input: {
   await input.assertOwned();
   const binding = { runId: context.runId, companyId: context.agent.companyId,
     agentId: context.agent.id, adapterType: context.agent.adapterType! };
-  const custody = await reserveLegacyAdapterCustody(input.db, binding);
+  const custody = await reserveLegacyAdapterCustody(input.db, binding, undefined,
+    prepareLegacyAdapterFinalizationInputs(input.preparedFinalization));
   const root = path.join(input.instanceRoot, "data", "legacy-adapter-workers", binding.companyId, custody.custodyId);
   await fs.mkdir(root, { recursive: true, mode: 0o700 });
   await input.assertOwned();

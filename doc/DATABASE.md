@@ -456,6 +456,16 @@ produce one owner, retain the executor identity and byte cursor, and record a
 `legacy_adapter_custody_claimed` run event in the transfer transaction. This
 permits consumption of the existing spool; it permits no new executor launch.
 
-Heartbeat restart routing and prepared terminal finalization remain incomplete.
+Host dispatch now commits `prepared_finalization_json` in the custody reservation
+transaction before executor launch. The strict versioned snapshot stores session
+identities, task identity, model, rotation, and config hashes for terminal
+projection. It excludes invocation config, credentials, and canonical config
+text. Repeated reservation must match the original snapshot. Historical custody
+keeps null preparation and cannot acquire it retroactively. Custody transfer
+retains the snapshot without modification.
+
+Live completion uses a common terminal projection function with explicit host
+inputs. Replacement consumption is not yet connected to this function.
+Heartbeat restart routing and replacement terminal finalization remain incomplete.
 These source checkpoints do not establish active-run adoption or installed
 hot-restart acceptance.

@@ -1,3 +1,4 @@
+import { preparedFinalizationFixture } from "./legacy-adapter-finalization-inputs.fixture.js";
 import { randomUUID } from "node:crypto";
 import { beforeAll, afterAll, describe, expect, it } from "vitest";
 import { eq, sql } from "drizzle-orm";
@@ -19,15 +20,35 @@ describe("legacy transport database custody", () => {
     await db.insert(agents).values({ id: agentId, companyId, name: "Fixture", adapterType: "codex_local" });
   }, 90000);
   afterAll(async () => { if (temporary) await temporary.cleanup(); });
-  async function fixture() {
+  async function fixture(preparation?: ReturnType<typeof preparedFinalizationFixture>) {
     const binding = { companyId, agentId, runId: randomUUID(), adapterType: "codex_local" };
     await db.insert(heartbeatRuns).values({ id: binding.runId, companyId, agentId, status: "running", runtimeMode: "legacy",
       controllerBootId: legacyControllerBootId, controllerLeaseExpiresAt: sql`clock_timestamp() + interval '60 seconds'` });
-    const custody = await reserveLegacyAdapterCustody(db, binding);
+    const custody = await reserveLegacyAdapterCustody(db, binding, undefined, preparation);
     return { ...binding, custodyId: custody.custodyId, expectedCursor: 0, nextCursor: 20,
       events: [{ kind: "dispatch" }] as LegacyAdapterWorkerEvent[],
       project: (event: LegacyAdapterWorkerEvent) => ({ eventType: "legacy_adapter_worker", payload: event }) };
   }
+
+  it("commits immutable host preparation before launch and preserves it through custody transfer", async () => {
+    const preparation = preparedFinalizationFixture();
+    const f = await fixture(preparation);
+    expect((await reserveLegacyAdapterCustody(db, f, undefined, preparation)).preparedFinalizationJson).toEqual(preparation);
+    await expect(reserveLegacyAdapterCustody(db, f, undefined, { ...preparation, configuredModel: "changed" }))
+      .rejects.toThrow("preparation mismatch");
+    const [before] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    expect(before.processPid).toBeNull();
+    await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: sql`clock_timestamp() - interval '1 second'` }).where(eq(heartbeatRuns.id, f.runId));
+    const replacement = await claimExpiredLegacyAdapterCustody(db, { ...f, previousBootId: legacyControllerBootId }, randomUUID());
+    expect(replacement?.custody.preparedFinalizationJson).toEqual(preparation);
+  });
+
+  it("does not retrofit prepared finalization into previously reserved custody", async () => {
+    const f = await fixture();
+    await expect(reserveLegacyAdapterCustody(db, f, undefined, preparedFinalizationFixture())).rejects.toThrow("preparation mismatch");
+    const [custody] = await db.select().from(legacyAdapterTransports).where(eq(legacyAdapterTransports.runId, f.runId));
+    expect(custody.preparedFinalizationJson).toBeNull();
+  });
 
   it("serializes two consumers and commits one event/cursor through the shared sequence allocator", async () => {
     const f = await fixture();

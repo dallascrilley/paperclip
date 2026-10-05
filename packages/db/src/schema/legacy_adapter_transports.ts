@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, bigint, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, bigint, timestamp, uniqueIndex, jsonb } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
@@ -13,6 +13,9 @@ export const legacyAdapterTransports = pgTable("legacy_adapter_transports", {
   // No agent-selected path or command is persisted here.
   custodyId: uuid("custody_id").notNull(),
   eventCursor: bigint("event_cursor", { mode: "number" }).notNull().default(0),
+  // Immutable host preparation, committed before dispatch. Historical custody
+  // has no snapshot and cannot use replacement-controller finalization.
+  preparedFinalizationJson: jsonb("prepared_finalization_json").$type<Record<string, unknown>>(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, table => ({ custodyUq: uniqueIndex("legacy_adapter_transports_custody_uq").on(table.custodyId) }));

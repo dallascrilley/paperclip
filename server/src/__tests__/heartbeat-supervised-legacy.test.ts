@@ -73,6 +73,11 @@ describe("opt-in supervised legacy heartbeat", () => {
     const [custody] = await db.select().from(legacyAdapterTransports).where(eq(legacyAdapterTransports.runId, run.id));
     expect(custody).toMatchObject({ companyId, agentId, adapterType: "codex_local" });
     expect(custody.eventCursor).toBeGreaterThan(0);
+    expect(custody.preparedFinalizationJson).toMatchObject({ version: 1, issueId,
+      configuredModel: "fixture", taskSessionReused: false });
+    expect(custody.preparedFinalizationJson).not.toHaveProperty("config");
+    expect(custody.preparedFinalizationJson).not.toHaveProperty("authToken");
+    expect(custody.preparedFinalizationJson?.sessionConfigMetadata).not.toHaveProperty("fingerprints");
     const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, run.id));
     expect(events.some(event => event.eventType === "legacy_adapter_worker")).toBe(true);
     expect(run.stdoutExcerpt).toContain("turn.completed");

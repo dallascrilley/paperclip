@@ -1,3 +1,5 @@
+import { prepareLegacyAdapterFinalizationInputs, type LegacyAdapterFinalizationInputs } from "./legacy-adapter-finalization-inputs.js";
+import { isDeepStrictEqual } from "node:util";
 import { randomUUID } from "node:crypto";
 import { and, eq, gt, lte, sql } from "drizzle-orm";
 import { agents, heartbeatRuns, legacyAdapterTransports, type Db } from "@paperclipai/db";
@@ -26,7 +28,9 @@ async function lockOwnedRun(tx: Transaction, binding: Binding, bootId: string) {
 /** Before any supervised spawn. Repeated reservation reuses custody, never
  * permits another launch; the spool's exclusive directory is the launch gate.
  */
-export async function reserveLegacyAdapterCustody(db: Db, binding: Binding, bootId: string = legacyControllerBootId) {
+export async function reserveLegacyAdapterCustody(db: Db, binding: Binding, bootId: string = legacyControllerBootId,
+  preparedFinalizationJson?: LegacyAdapterFinalizationInputs) {
+  const preparation = preparedFinalizationJson ? prepareLegacyAdapterFinalizationInputs(preparedFinalizationJson) : undefined;
   if (!SUPERVISED_LEGACY_ADAPTERS.has(binding.adapterType)) throw new Error("Unsupported legacy adapter custody");
   return db.transaction(async tx => {
     if (!await lockOwnedRun(tx, binding, bootId)) throw new Error("Legacy adapter custody ownership lost");
@@ -35,9 +39,12 @@ export async function reserveLegacyAdapterCustody(db: Db, binding: Binding, boot
       if (existing.companyId !== binding.companyId || existing.agentId !== binding.agentId || existing.adapterType !== binding.adapterType) {
         throw new Error("Legacy adapter custody binding mismatch");
       }
+      if (preparation && !isDeepStrictEqual(existing.preparedFinalizationJson, preparation)) {
+        throw new Error("Legacy adapter finalization preparation mismatch");
+      }
       return existing;
     }
-    const [created] = await tx.insert(legacyAdapterTransports).values({ ...binding, custodyId: randomUUID() }).returning();
+    const [created] = await tx.insert(legacyAdapterTransports).values({ ...binding, custodyId: randomUUID(), preparedFinalizationJson: preparation }).returning();
     return created;
   });
 }
