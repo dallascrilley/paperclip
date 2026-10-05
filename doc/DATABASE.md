@@ -432,3 +432,23 @@ cleanup authority; it does not prove that remote inference has stopped. Recovery
 revokes the previous boot identity with a conditional update. Its own claim also
 expires so another sweep can finish cleanup after a restart. Historical rows keep
 null ownership fields and follow the previous recovery path.
+
+### Independent legacy adapter transport custody
+
+`legacy_adapter_transports` holds host-owned custody for supervised legacy
+workers. Each run has at most one row, with company, agent, adapter, an opaque
+custody ID and an acknowledged byte cursor. The instance resolves that ID under
+its private spool root; adapter results cannot select a path or replace custody.
+No provider credentials or executor commands are stored in this table.
+
+The event consumer locks the running legacy row and verifies its controller
+boot ID and database-clock lease. It uses the shared run-event sequence allocator
+and commits event rows, spawn metadata and the byte cursor in one transaction.
+A stale controller or cursor cannot commit a second copy of a batch. Projection
+failure or lease expiry during ingestion rolls back the entire batch. Hosts must
+apply run-log redaction and payload limits before insertion and publish live
+events only after commit.
+
+This custody layer is a source checkpoint. Heartbeat dispatch, controller
+replacement and terminal run finalization do not use it yet. Its presence does
+not establish active-run adoption or installed hot-restart acceptance.
