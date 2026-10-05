@@ -364,6 +364,14 @@ export type TaskWatchdogOwnWriteTarget = {
    * exactly this interaction id and nothing else.
    */
   removableInteractionId?: string | null;
+  /**
+   * Issue-level mutations (comment, PATCH): the material leaf fields the request itself set
+   * and the values it set them to. Every other leaf field, pending interaction, pending
+   * approval and wait on the target must be unchanged, and a named field must equal the
+   * requested value. A change by another actor to the same target therefore is not absorbed
+   * unless it happens to produce exactly the requested value.
+   */
+  expectedLeafChange?: Partial<Pick<TaskWatchdogMaterialLeaf, "status" | "assigneeAgentId" | "assigneeUserId" | "blockerIssueIds">>;
 };
 
 /**
@@ -394,9 +402,21 @@ export function snapshotDeltaConfinedToMutation(
   }
 
   const removable = target.removableInteractionId ?? null;
-  if (removable === null) return true; // issue-level mutation: the target issue is the mutation's own subject.
   const a = beforeLeaves.get(target.targetIssueId);
   const b = afterLeaves.get(target.targetIssueId);
+  if (removable === null) {
+    if (!a || !b) return !a && !b;
+    if (canonicalJson(before.waitsByIssueId[target.targetIssueId] ?? null) !== canonicalJson(after.waitsByIssueId[target.targetIssueId] ?? null)) {
+      return false;
+    }
+    const expected = target.expectedLeafChange ?? {};
+    for (const key of ["status", "assigneeAgentId", "assigneeUserId", "blockerIssueIds", "pendingInteractionIds", "pendingApprovalIds"] as const) {
+      const sortIfList = (value: unknown) => (Array.isArray(value) ? [...value].sort() : value);
+      const want = key in expected ? (expected as Record<string, unknown>)[key] : a[key];
+      if (canonicalJson(sortIfList(b[key])) !== canonicalJson(sortIfList(want))) return false;
+    }
+    return true;
+  }
   if (!a || !b) return false;
   // Interaction resolution: the leaf may only lose the resolved interaction id.
   const expectedInteractionIds = a.pendingInteractionIds.filter((id) => id !== removable);

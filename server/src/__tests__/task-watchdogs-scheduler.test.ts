@@ -13,6 +13,7 @@ import {
   issueComments,
   issueDocuments,
   issueApprovals,
+  issueRelations,
   issueThreadInteractions,
   issueWorkProducts,
   issues,
@@ -762,6 +763,65 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
 
       expect(result).toMatchObject({ advanced: false, reason: "external_change" });
       expect(await t.recordedFingerprint()).toBe(t.stopFingerprint);
+    });
+
+    describe("issue-level own writes", () => {
+      it("advances over a PATCH whose requested status is what the target now has", async () => {
+        const t = await setup();
+        const baseline = await revalidatedBaseline(t);
+        await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, t.sourceId));
+        const result = await t.service.advanceMutationScopeFingerprint(t.scope(t.stopFingerprint), t.runId, {
+          baseline,
+          targetIssueId: t.sourceId,
+          expectedLeafChange: { status: "blocked" },
+        });
+        expect(result).toMatchObject({ advanced: true });
+      });
+
+      it("refuses an external blocker added to the target during the run's own comment", async () => {
+        const t = await setup();
+        const baseline = await revalidatedBaseline(t);
+        const blockerId = await seedIssue(t.companyId, { identifier: "WDOG-EXT-BLOCKER", status: "todo" });
+        await db.insert(issueRelations).values({
+          companyId: t.companyId,
+          issueId: blockerId,
+          relatedIssueId: t.sourceId,
+          type: "blocks",
+        });
+        const result = await t.service.advanceMutationScopeFingerprint(t.scope(t.stopFingerprint), t.runId, {
+          baseline,
+          targetIssueId: t.sourceId,
+          expectedLeafChange: {},
+        });
+        expect(result).toMatchObject({ advanced: false, reason: "external_change" });
+        expect(await t.recordedFingerprint()).toBe(t.stopFingerprint);
+      });
+
+      it("refuses an external pending interaction created on the target during the run's own comment", async () => {
+        const t = await setup();
+        const baseline = await revalidatedBaseline(t);
+        await seedPendingInteraction(t.companyId, t.sourceId, t.agentId);
+        const result = await t.service.advanceMutationScopeFingerprint(t.scope(t.stopFingerprint), t.runId, {
+          baseline,
+          targetIssueId: t.sourceId,
+          expectedLeafChange: {},
+        });
+        expect(result).toMatchObject({ advanced: false, reason: "external_change" });
+        expect(await t.recordedFingerprint()).toBe(t.stopFingerprint);
+      });
+
+      it("refuses a status the request did not ask for", async () => {
+        const t = await setup();
+        const baseline = await revalidatedBaseline(t);
+        await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, t.sourceId));
+        const result = await t.service.advanceMutationScopeFingerprint(t.scope(t.stopFingerprint), t.runId, {
+          baseline,
+          targetIssueId: t.sourceId,
+          expectedLeafChange: { status: "blocked" },
+        });
+        expect(result.advanced).toBe(false);
+        expect(await t.recordedFingerprint()).toBe(t.stopFingerprint);
+      });
     });
 
     it("does not advance for a run that was never authorized with the current fingerprint", async () => {

@@ -5418,6 +5418,19 @@ export function issueRoutes(
 
   const taskWatchdogOwnWriteArmed = new WeakSet<Response>();
 
+  /** The material leaf fields a PATCH names, with the values it sets. Comments name none. */
+  function requestedLeafChange(req: Request): NonNullable<TaskWatchdogOwnWriteTarget["expectedLeafChange"]> {
+    const body = req.method === "PATCH" && req.body && typeof req.body === "object"
+      ? (req.body as Record<string, unknown>)
+      : {};
+    const change: NonNullable<TaskWatchdogOwnWriteTarget["expectedLeafChange"]> = {};
+    if (typeof body.status === "string") change.status = body.status;
+    if ("assigneeAgentId" in body) change.assigneeAgentId = (body.assigneeAgentId as string | null) ?? null;
+    if ("assigneeUserId" in body) change.assigneeUserId = (body.assigneeUserId as string | null) ?? null;
+    if (Array.isArray(body.blockedByIssueIds)) change.blockerIssueIds = body.blockedByIssueIds.filter((id): id is string => typeof id === "string");
+    return change;
+  }
+
   /**
    * A watchdog run's own authorized mutation can change the stop fingerprint it was
    * authorized with (e.g. withdrawing a pending interaction). Once the mutation
@@ -5484,6 +5497,7 @@ export function issueRoutes(
     if (revalidated.allowed) {
       armTaskWatchdogOwnWriteAdvance(res, scope, revalidated, {
         targetIssueId: issue.id,
+        expectedLeafChange: requestedLeafChange(res.req),
       });
       return true;
     }
