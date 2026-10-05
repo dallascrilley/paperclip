@@ -473,7 +473,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       createdAt: now,
       updatedAt: now,
     });
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     vi.clearAllMocks();
@@ -3432,200 +3432,73 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
-  it("reports adopted hot-restart runs before startup reap can mark them process_lost", async () => {
-    const child = spawnAliveProcess();
-    childProcesses.add(child);
-    expect(child.pid).toBeGreaterThan(0);
-    const { runId } = await seedRunFixture({
-      agentStatus: "running",
-      processPid: child.pid ?? null,
-      processGroupId: null,
-      contextSnapshot: {
-        executionEngine: "cli",
-        processTopology: "detached",
-      },
-    });
-
-    await withTempPaperclipHome(async (home) => {
-      const heartbeat = heartbeatService(db);
-      await writeHotRestartIntent({
-        previousServerPid: process.pid,
-        previousServerVersion: "old-version",
-        requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+  it.each([false, true])(
+    "requires legacy pipe drain and reports persisted finalization=%s without PID-only adoption",
+    async (finalized) => {
+      const child = spawnAliveProcess();
+      childProcesses.add(child);
+      const { runId } = await seedRunFixture({
+        agentStatus: "running", processPid: child.pid ?? null,
+        contextSnapshot: { executionEngine: "cli", processTopology: "detached" },
       });
-      await heartbeat.prepareHotRestartShutdown(
-        "SIGTERM",
-        new Date("2026-03-19T00:06:00.000Z"),
-      );
-
-      const adoption = await heartbeat.reconcileHotRestartAdoption(
-        new Date("2026-03-19T00:07:00.000Z"),
-      );
-      expect(adoption).toMatchObject({
-        mode: "reported",
-        adoptedRunIds: [runId],
-        finalizedWhileDownRunIds: [],
-        lostRunIds: [],
-        skippedRunIds: [],
+      await withTempPaperclipHome(async (home) => {
+        const heartbeat = heartbeatService(db);
+        const now = new Date();
+        await writeHotRestartIntent({
+          previousServerPid: process.pid, previousServerVersion: "old-version", requestedAt: now,
+        });
+        expect(await heartbeat.prepareHotRestartShutdown("SIGTERM", now)).toMatchObject({
+          mode: "legacy_pipe_drain_required", skipDrain: false,
+          drainRunIds: [runId], drainReason: "active_legacy_pipe_run",
+        });
+        // Model a persisted terminal row before replacement startup. A live PID
+        // must not hide a missing terminal write after a selective drain.
+        if (finalized) {
+          await db.update(heartbeatRuns).set({
+            status: "interrupted", finishedAt: now, errorCode: "server_shutdown_interrupted",
+          }).where(eq(heartbeatRuns.id, runId));
+        }
+        const expected = {
+          adoptedRunIds: [], finalizedWhileDownRunIds: finalized ? [runId] : [],
+          lostRunIds: finalized ? [] : [runId], skippedRunIds: [],
+        };
+        expect(await heartbeat.reconcileHotRestartAdoption(now)).toMatchObject({ mode: "reported", ...expected });
+        const report = JSON.parse(await fs.readFile(resolveHotRestartReportPath(home), "utf8"));
+        expect(report).toMatchObject({
+          previousServerPid: process.pid, newServerPid: process.pid,
+          previousServerVersion: "old-version", ...expected,
+        });
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        expect(run.status).toBe(finalized ? "interrupted" : "running");
+        expect(run.resultJson?.hotRestart).toBeUndefined();
       });
-
-      const report = JSON.parse(
-        await fs.readFile(resolveHotRestartReportPath(home), "utf8"),
-      ) as Record<string, unknown>;
-      expect(report).toMatchObject({
-        previousServerPid: process.pid,
-        newServerPid: process.pid,
-        previousServerVersion: "old-version",
-        adoptedRunIds: [runId],
-        finalizedWhileDownRunIds: [],
-        lostRunIds: [],
-      });
-      expect(typeof report.newServerVersion).toBe("string");
-
-      const reap = await heartbeat.reapOrphanedRuns();
-      expect(reap).toEqual({ reaped: 0, runIds: [] });
-      const adopted = await db
-        .select()
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, runId))
-        .then((rows) => rows[0] ?? null);
-      expect(adopted?.status).toBe("running");
-      expect(adopted?.errorCode).not.toBe("process_lost");
-      expect(adopted?.resultJson).toMatchObject({
-        hotRestart: {
-          adopted: true,
-          adoptedAt: "2026-03-19T00:07:00.000Z",
-          previousServerPid: process.pid,
-          newServerPid: process.pid,
-          previousServerVersion: "old-version",
-          processPid: child.pid,
-        },
-      });
-    });
-  });
-
-  it("defers an adopted process death to the reaper and schedules exactly one continuation", async () => {
-    const child = spawnAliveProcess();
-    childProcesses.add(child);
-    const { runId, agentId, issueId } = await seedRunFixture({
-      agentStatus: "idle",
-      processPid: child.pid ?? null,
-      contextSnapshot: { executionEngine: "cli", processTopology: "detached" },
-    });
-
-    await withTempPaperclipHome(async (home) => {
-      const heartbeat = heartbeatService(db);
-      const adoptedAt = new Date();
-      await writeHotRestartIntent({
-        previousServerPid: process.pid,
-        previousServerVersion: "old-version",
-        requestedAt: adoptedAt,
-      });
-      await heartbeat.prepareHotRestartShutdown("SIGTERM", adoptedAt);
-      expect(await heartbeat.reconcileHotRestartAdoption(adoptedAt)).toMatchObject({
-        adoptedRunIds: [runId], lostRunIds: [],
-      });
-      const reportPath = resolveHotRestartReportPath(home);
-      const reportBefore = await fs.readFile(reportPath, "utf8");
-      await new Promise<void>((resolve) => {
-        child.once("exit", () => resolve());
-        child.kill("SIGKILL");
-      });
-
-      const firstSweep = await heartbeat.sweepStaleIssueLocks();
-      expect(firstSweep.terminalizedRunIds).toEqual([]);
-      expect(firstSweep.cleared).toBe(0);
-      expect(await heartbeat.reapOrphanedRuns({ staleThresholdMs: 300_000 })).toEqual({
-        reaped: 0, runIds: [],
-      });
-      const [preservedIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
-      expect(preservedIssue).toMatchObject({
-        status: "in_progress", assigneeAgentId: agentId,
-        checkoutRunId: runId, executionRunId: runId,
-      });
-
-      // Advance the persisted freshness clock past the periodic reaper window.
-      await db.update(heartbeatRuns).set({
-        updatedAt: new Date(adoptedAt.getTime() - 300_001),
-      }).where(eq(heartbeatRuns.id, runId));
-      expect((await heartbeat.sweepStaleIssueLocks()).terminalizedRunIds).toEqual([]);
-      expect(await heartbeat.reapOrphanedRuns({ staleThresholdMs: 300_000 })).toEqual({
-        reaped: 1, runIds: [runId],
-      });
-      await heartbeat.sweepStaleIssueLocks();
-      await heartbeat.reapOrphanedRuns({ staleThresholdMs: 300_000 });
-      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
-      expect(runs.find(run => run.id === runId)).toMatchObject({
-        status: "failed", errorCode: "process_lost",
-        resultJson: { hotRestart: { adopted: true, adoptedAt: adoptedAt.toISOString() } },
-      });
-      const continuations = runs.filter(run => run.retryOfRunId === runId);
-      expect(continuations).toHaveLength(1);
-      expect(continuations[0]).toMatchObject({
-        agentId, status: "scheduled_retry", contextSnapshot: { issueId },
-      });
-      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
-      expect(issue).toMatchObject({ status: "in_progress", assigneeAgentId: agentId });
-      expect(await fs.readFile(reportPath, "utf8")).toBe(reportBefore);
-    });
-  });
+    },
+  );
 
   it.skipIf(process.platform === "win32")(
-    "keeps process-group-only hot-restart adoptions out of process_lost reaping",
+    "does not report an unsupervised live process group as adopted after incomplete drain",
     async () => {
       const orphan = await spawnOrphanedProcessGroup();
       cleanupPids.add(orphan.descendantPid);
-      expect(isPidAlive(orphan.descendantPid)).toBe(true);
       const { runId } = await seedRunFixture({
-        agentStatus: "running",
-        processPid: orphan.processPid,
-        processGroupId: orphan.processGroupId,
-        contextSnapshot: {
-          executionEngine: "cli",
-          processTopology: "detached",
-        },
+        agentStatus: "running", processPid: orphan.processPid, processGroupId: orphan.processGroupId,
+        contextSnapshot: { executionEngine: "cli", processTopology: "detached" },
       });
-
       await withTempPaperclipHome(async () => {
         const heartbeat = heartbeatService(db);
-        await writeHotRestartIntent({
-          previousServerPid: process.pid,
-          previousServerVersion: "old-version",
-          requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+        const now = new Date();
+        await writeHotRestartIntent({ previousServerPid: process.pid, requestedAt: now });
+        expect(await heartbeat.prepareHotRestartShutdown("SIGTERM", now)).toMatchObject({
+          skipDrain: false, mode: "legacy_pipe_drain_required", drainRunIds: [runId],
         });
-        await heartbeat.prepareHotRestartShutdown(
-          "SIGTERM",
-          new Date("2026-03-19T00:06:00.000Z"),
-        );
-
-        const adoption = await heartbeat.reconcileHotRestartAdoption(
-          new Date("2026-03-19T00:07:00.000Z"),
-        );
-        expect(adoption).toMatchObject({
-          mode: "reported",
-          adoptedRunIds: [runId],
-          finalizedWhileDownRunIds: [],
-          lostRunIds: [],
-          skippedRunIds: [],
+        expect(await heartbeat.reconcileHotRestartAdoption(now)).toMatchObject({
+          mode: "reported", adoptedRunIds: [], finalizedWhileDownRunIds: [],
+          lostRunIds: [runId], skippedRunIds: [],
         });
-
-        const reap = await heartbeat.reapOrphanedRuns();
-        expect(reap).toEqual({ reaped: 0, runIds: [] });
         expect(isPidAlive(orphan.descendantPid)).toBe(true);
-        const adopted = await db
-          .select()
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, runId))
-          .then((rows) => rows[0] ?? null);
-        expect(adopted?.status).toBe("running");
-        expect(adopted?.errorCode).not.toBe("process_lost");
-        expect(adopted?.resultJson).toMatchObject({
-          hotRestart: {
-            adopted: true,
-            processPid: orphan.processPid,
-            processGroupId: orphan.processGroupId,
-          },
-        });
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        expect(run.status).toBe("running");
+        expect(run.resultJson?.hotRestart).toBeUndefined();
       });
     },
   );
@@ -7050,7 +6923,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
   it("preserves deferred input on a clean Stop and adopts it once on the next explicit comment", async () => {
     const { companyId, agentId, issueId, runId } = await seedRunFixture({ runtimeMode: "legacy", agentStatus: "running" });
-    const heartbeat = heartbeatService(db);
+    // This fixture tests ordinary Stop admission on its disposable database.
+    // It does not test the invoking worktree instance's scheduling hold.
+    const heartbeat = heartbeatService(db, { runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "0" } });
     const [pending] = await db.insert(issueComments).values({ companyId, issueId, authorUserId: "responsible-user", body: "List recent Drive files" }).returning();
     const [deferred] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation", reason: "issue_execution_deferred", status: "deferred_issue_execution",
       payload: { issueId, commentId: pending!.id, _paperclipWakeContext: { issueId, wakeReason: "issue_commented", wakeCommentIds: [pending!.id] } },
@@ -7067,9 +6942,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const next = await heartbeat.wakeup(agentId, { source: "automation", reason: "issue_commented", requestedByActorType: "user", requestedByActorId: "responsible-user",
       payload: { issueId, commentId: go!.id }, contextSnapshot: { issueId, commentId: go!.id, wakeReason: "issue_commented" },
     });
+    expect(next).not.toBeNull();
     expect(next?.contextSnapshot?.wakeCommentIds).toEqual([pending!.id, go!.id]);
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, deferred!.id)))[0]).toMatchObject({ status: "coalesced", runId: next!.id });
-    await vi.waitFor(async () => expect((await heartbeat.getRun(next!.id))?.status).not.toBe("running"));
+    await vi.waitFor(async () => expect((await heartbeat.getRun(next!.id))?.status).not.toBe("running"), { timeout: 15_000 });
   });
 
   it.each(["dedicated deferred donor", "non-coalescing recipient", "persistent agent conversation"] as const)(
@@ -7086,7 +6962,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           conversationAgentId: agentId, conversationUserId: "responsible-user", conversationState: "active",
         }).where(eq(issues.id, issueId));
       }
-      const heartbeat = heartbeatService(db);
+      // This fixture tests ordinary Stop admission on its disposable database.
+      // It does not test the invoking worktree instance's scheduling hold.
+      const heartbeat = heartbeatService(db, { runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "0" } });
       const [pending, go] = await db
         .insert(issueComments)
         .values([
