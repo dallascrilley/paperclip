@@ -592,6 +592,135 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     });
   });
 
+  describe("own-write fingerprint advancement", () => {
+    async function seedPendingInteraction(companyId: string, issueId: string, agentId: string) {
+      const id = randomUUID();
+      await db.insert(issueThreadInteractions).values({
+        id,
+        companyId,
+        issueId,
+        kind: "request_confirmation",
+        status: "pending",
+        payload: { version: 1, prompt: "Confirm." },
+        createdByAgentId: agentId,
+      });
+      return id;
+    }
+
+    async function setup() {
+      const companyId = await seedCompany();
+      const sourceId = await seedIssue(companyId, { identifier: "WDOG-OWNWRITE", status: "in_review" });
+      const agentId = await seedAgent(companyId);
+      const interactionId = await seedPendingInteraction(companyId, sourceId, agentId);
+      const secondInteractionId = await seedPendingInteraction(companyId, sourceId, agentId);
+      await seedWatchdog(companyId, sourceId, agentId);
+      const { service } = createService();
+      await service.reconcileTaskWatchdogs({ companyId });
+      const [watchdog] = await db.select().from(issueWatchdogs).where(eq(issueWatchdogs.issueId, sourceId));
+      const stopFingerprint = watchdog!.lastObservedFingerprint!;
+      const [run] = await db.insert(heartbeatRuns).values({
+        companyId,
+        agentId,
+        status: "running",
+        invocationSource: "automation",
+        contextSnapshot: {
+          taskWatchdog: { watchedIssueId: sourceId, stopFingerprint },
+        },
+      }).returning();
+      const scope = (fingerprint: string | null) => ({
+        kind: "watchdog" as const,
+        watchdogId: watchdog!.id,
+        companyId,
+        watchedIssueId: sourceId,
+        stopFingerprint: fingerprint,
+      });
+      const recordedFingerprint = async () => {
+        const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id));
+        return (row!.contextSnapshot as { taskWatchdog: { stopFingerprint: string } }).taskWatchdog.stopFingerprint;
+      };
+      return { companyId, sourceId, agentId, interactionId, secondInteractionId, service, stopFingerprint, runId: run!.id, scope, recordedFingerprint };
+    }
+
+    it("lets a recovery decision follow the run's own interaction withdrawal", async () => {
+      const t = await setup();
+      expect((await t.service.revalidateMutationScope(t.scope(t.stopFingerprint))).allowed).toBe(true);
+      await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.id, t.interactionId));
+
+      // Reproduces the defect: without advancement the run's own write makes its fingerprint stale.
+      const stale = await t.service.revalidateMutationScope(t.scope(t.stopFingerprint));
+      expect(stale.allowed).toBe(false);
+      expect(stale.reason).toContain("stop fingerprint changed");
+
+      const advanced = await t.service.advanceMutationScopeFingerprint(t.scope(t.stopFingerprint), t.runId);
+      expect(advanced).toMatchObject({ advanced: true, from: t.stopFingerprint });
+      const recorded = await t.recordedFingerprint();
+      expect(recorded).not.toBe(t.stopFingerprint);
+      expect((await t.service.revalidateMutationScope(t.scope(recorded))).allowed).toBe(true);
+
+      // A second own write (the other pending card) chains the same way.
+      await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.id, t.secondInteractionId));
+      const chained = await t.service.advanceMutationScopeFingerprint(t.scope(recorded), t.runId);
+      expect(chained.advanced).toBe(true);
+      expect((await t.service.revalidateMutationScope(t.scope(await t.recordedFingerprint()))).allowed).toBe(true);
+    });
+
+    it("still rejects an external change made after the run's own write", async () => {
+      const t = await setup();
+      await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.id, t.interactionId));
+      await t.service.advanceMutationScopeFingerprint(t.scope(t.stopFingerprint), t.runId);
+      const recorded = await t.recordedFingerprint();
+
+      await seedPendingInteraction(t.companyId, t.sourceId, t.agentId);
+
+      const revalidated = await t.service.revalidateMutationScope(t.scope(recorded));
+      expect(revalidated.allowed).toBe(false);
+      expect(revalidated.reason).toContain("stop fingerprint changed");
+    });
+
+    it("does not advance for a run that was never authorized with the current fingerprint", async () => {
+      const t = await setup();
+      await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.id, t.interactionId));
+
+      const result = await t.service.advanceMutationScopeFingerprint(t.scope("task_watchdog_stop:other"), t.runId);
+
+      expect(result).toMatchObject({ advanced: false, reason: "run_fingerprint_moved" });
+      expect(await t.recordedFingerprint()).toBe(t.stopFingerprint);
+    });
+
+    it("is idempotent when nothing changed or the advance is repeated", async () => {
+      const t = await setup();
+      expect(await t.service.advanceMutationScopeFingerprint(t.scope(t.stopFingerprint), t.runId))
+        .toMatchObject({ advanced: false, reason: "unchanged" });
+
+      await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.id, t.interactionId));
+      const first = await t.service.advanceMutationScopeFingerprint(t.scope(t.stopFingerprint), t.runId);
+      expect(first.advanced).toBe(true);
+      const recorded = await t.recordedFingerprint();
+
+      expect(await t.service.advanceMutationScopeFingerprint(t.scope(t.stopFingerprint), t.runId))
+        .toMatchObject({ advanced: false, reason: "run_fingerprint_moved" });
+      expect(await t.service.advanceMutationScopeFingerprint(t.scope(recorded), t.runId))
+        .toMatchObject({ advanced: false, reason: "unchanged" });
+      expect(await t.recordedFingerprint()).toBe(recorded);
+    });
+
+    it("does not advance when the own write leaves the subtree with a live path", async () => {
+      const t = await setup();
+      await db.insert(heartbeatRuns).values({
+        companyId: t.companyId,
+        agentId: t.agentId,
+        status: "running",
+        invocationSource: "assignment",
+        contextSnapshot: { issueId: t.sourceId },
+      });
+
+      const result = await t.service.advanceMutationScopeFingerprint(t.scope(t.stopFingerprint), t.runId);
+
+      expect(result).toMatchObject({ advanced: false, reason: "not_stopped" });
+      expect(await t.recordedFingerprint()).toBe(t.stopFingerprint);
+    });
+  });
+
   it("surfaces pending interaction kinds and approval ids in the wake and watchdog comment", async () => {
     const companyId = await seedCompany();
     const sourceId = await seedIssue(companyId, { identifier: "WDOG-WAITS", status: "in_review" });

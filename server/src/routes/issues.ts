@@ -565,6 +565,10 @@ function noopTaskWatchdogService(): TaskWatchdogService {
         pendingInteractionsByIssueId: {},
       },
     }),
+    advanceMutationScopeFingerprint: async () => ({
+      advanced: false as const,
+      reason: "watchdog_inactive" as const,
+    }),
   };
 }
 
@@ -5411,6 +5415,46 @@ export function issueRoutes(
     return true;
   }
 
+  const taskWatchdogOwnWriteArmed = new WeakSet<Response>();
+
+  /**
+   * A watchdog run's own authorized mutation can change the stop fingerprint it was
+   * authorized with (e.g. withdrawing a pending interaction). Once the mutation
+   * succeeds, record the new fingerprint on the run before the response is released
+   * so the run's next mutation revalidates against its own write, while any other
+   * change to the subtree still makes the review stale.
+   */
+  function armTaskWatchdogOwnWriteAdvance(
+    res: Response,
+    scope: Extract<
+      Awaited<ReturnType<typeof resolveTaskWatchdogMutationScope>>,
+      { kind: "watchdog" }
+    >,
+  ) {
+    if (taskWatchdogOwnWriteArmed.has(res)) return;
+    taskWatchdogOwnWriteArmed.add(res);
+    const originalEnd = res.end.bind(res) as (...args: unknown[]) => Response;
+    let armed = true;
+    (res as { end: unknown }).end = (...args: unknown[]) => {
+      if (!armed) return originalEnd(...args);
+      armed = false;
+      res.end = originalEnd as Response["end"];
+      if (res.statusCode >= 400) return originalEnd(...args);
+      void taskWatchdogsSvc
+        .advanceMutationScopeFingerprint(scope, scope.runId)
+        .catch((err: unknown) => {
+          logger.warn(
+            { err, watchdogId: scope.watchdogId, runId: scope.runId },
+            "task watchdog own-write fingerprint advance failed",
+          );
+        })
+        .finally(() => {
+          originalEnd(...args);
+        });
+      return res;
+    };
+  }
+
   async function assertFreshTaskWatchdogSourceMutation(
     res: Response,
     scope: Awaited<ReturnType<typeof resolveTaskWatchdogMutationScope>>,
@@ -5421,7 +5465,10 @@ export function issueRoutes(
       return true;
 
     const revalidated = await taskWatchdogsSvc.revalidateMutationScope(scope);
-    if (revalidated.allowed) return true;
+    if (revalidated.allowed) {
+      armTaskWatchdogOwnWriteAdvance(res, scope);
+      return true;
+    }
     res.status(409).json({
       error: revalidated.reason,
       details: {
@@ -5609,6 +5656,7 @@ export function issueRoutes(
             "This issue-thread interaction is outside the current watchdog scope",
         });
       }
+      armTaskWatchdogOwnWriteAdvance(res, watchdogScope);
       return true;
     }
 

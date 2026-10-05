@@ -61,6 +61,7 @@ vi.mock("../services/native-runtime/native-question-bridge.js", () => ({
 const mockQuestionResponseDeliveries = vi.hoisted(() => ({
   deliver: vi.fn(async () => null),
 }));
+const mockAdvanceMutationScopeFingerprint = vi.hoisted(() => vi.fn(async () => ({ advanced: false, reason: "unchanged" })));
 const mockResolveTaskWatchdogMutationScope = vi.hoisted(() => vi.fn(async () => ({ kind: "none" })));
 const mockResolveCoreTrustPreset = vi.hoisted(() => vi.fn(() => ({ kind: "standard" })));
 const mockRunAttribution = vi.hoisted(() => ({
@@ -228,6 +229,7 @@ function registerModuleMocks() {
       upsertForIssue: vi.fn(),
       disableForIssue: vi.fn(async () => null),
       revalidateMutationScope: vi.fn(async (scope: unknown) => ({ allowed: true, scope })),
+      advanceMutationScopeFingerprint: mockAdvanceMutationScopeFingerprint,
     }),
     logActivity: mockLogActivity,
     projectService: () => ({}),
@@ -337,6 +339,7 @@ describe.sequential("issue thread interaction routes", () => {
     mockQuestionResponseDeliveries.deliver.mockResolvedValue(null);
     mockRequestNativeQuestionRunCancellation.mockResolvedValue(null);
     mockResolveTaskWatchdogMutationScope.mockResolvedValue({ kind: "none" });
+    mockAdvanceMutationScopeFingerprint.mockClear();
     mockResolveCoreTrustPreset.mockReturnValue({ kind: "standard" });
     mockAccessDecide.mockImplementation(async (input: { action?: string }) => ({
       allowed: true,
@@ -1057,6 +1060,26 @@ describe.sequential("issue thread interaction routes", () => {
       expect.objectContaining({ afterResolveInTransaction: expect.any(Function) }),
     );
     expect(res.status).toBe(200);
+  });
+
+  it("advances the watchdog run fingerprint once after its own withdrawal succeeds", async () => {
+    const scope = {
+      kind: "watchdog",
+      watchdogId: "watchdog-1",
+      companyId: "company-1",
+      watchedIssueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      watchdogIssueId: null,
+      stopFingerprint: "stop-1",
+      runId: RUN_WATCHDOG,
+    };
+    mockResolveTaskWatchdogMutationScope.mockResolvedValue(scope);
+    const app = await createApp({ type: "agent", agentId: ASSIGNEE_AGENT_ID, companyId: "company-1", runId: RUN_WATCHDOG });
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-withdraw/withdraw")
+      .send({});
+    expect(res.status).toBe(200);
+    expect(mockAdvanceMutationScopeFingerprint).toHaveBeenCalledTimes(1);
+    expect(mockAdvanceMutationScopeFingerprint).toHaveBeenCalledWith(scope, RUN_WATCHDOG);
   });
 
   it("rejects withdrawal by low-trust actors", async () => {

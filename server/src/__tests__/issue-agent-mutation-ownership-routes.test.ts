@@ -105,6 +105,7 @@ const mockTaskWatchdogService = vi.hoisted(() => ({
     allowed: true,
     classification: { state: "stopped", stopFingerprint: "task_watchdog_stop:test" },
   })),
+  advanceMutationScopeFingerprint: vi.fn(async () => ({ advanced: false, reason: "unchanged" })),
   reconcileForIssueAndAncestors: vi.fn(async () => ({
     checked: 0,
     triggered: 0,
@@ -554,6 +555,7 @@ describe("agent issue mutation checkout ownership", () => {
     });
     mockTaskWatchdogService.getActiveForIssue.mockReset();
     mockTaskWatchdogService.getActiveForIssue.mockResolvedValue(null);
+    mockTaskWatchdogService.advanceMutationScopeFingerprint.mockClear();
     mockTaskWatchdogService.revalidateMutationScope.mockReset();
     mockTaskWatchdogService.revalidateMutationScope.mockResolvedValue({
       allowed: true,
@@ -2689,6 +2691,59 @@ describe("agent issue mutation checkout ownership", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(409);
       expect(res.body.error).toContain("Task-watchdog review is stale");
       expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("advances the watchdog run fingerprint after a successful own write", async () => {
+      denyBaseBoundary();
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId }));
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...makeIssue({ assigneeAgentId: ownerAgentId }),
+        ...patch,
+      }));
+      let advancedBeforeResponse = false;
+      mockTaskWatchdogService.advanceMutationScopeFingerprint.mockImplementationOnce(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        advancedBeforeResponse = true;
+        return { advanced: true, from: "task_watchdog_stop:test", to: "task_watchdog_stop:next" } as never;
+      });
+
+      const app = await createApp(watchdogActor(), createWatchdogDb());
+      const res = await request(app).patch(`/api/issues/${issueId}`).send({ status: "blocked" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(advancedBeforeResponse).toBe(true);
+      expect(mockTaskWatchdogService.advanceMutationScopeFingerprint).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "watchdog", stopFingerprint: "task_watchdog_stop:test", runId: watchdogRunId }),
+        watchdogRunId,
+      );
+    });
+
+    it("does not advance the watchdog run fingerprint when the mutation is rejected as stale", async () => {
+      denyBaseBoundary();
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId }));
+      mockTaskWatchdogService.revalidateMutationScope.mockResolvedValueOnce({
+        allowed: false,
+        reason: "Task-watchdog review is stale because the watched subtree stop fingerprint changed; refresh the source state before mutating it.",
+        classification: { state: "stopped", stopFingerprint: "task_watchdog_stop:external" },
+      });
+
+      const app = await createApp(watchdogActor(), createWatchdogDb());
+      const res = await request(app).patch(`/api/issues/${issueId}`).send({ status: "blocked" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(mockTaskWatchdogService.advanceMutationScopeFingerprint).not.toHaveBeenCalled();
+    });
+
+    it("does not advance the watchdog run fingerprint when the mutation itself fails", async () => {
+      denyBaseBoundary();
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId }));
+      mockIssueService.update.mockResolvedValue(null as never);
+
+      const app = await createApp(watchdogActor(), createWatchdogDb());
+      const res = await request(app).patch(`/api/issues/${issueId}`).send({ status: "blocked" });
+
+      expect(res.status).toBeGreaterThanOrEqual(400);
+      expect(mockTaskWatchdogService.advanceMutationScopeFingerprint).not.toHaveBeenCalled();
     });
 
     it("suppresses watchdog follow-up creation when current source revalidation is live", async () => {

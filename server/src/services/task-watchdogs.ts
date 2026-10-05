@@ -1657,6 +1657,75 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     };
   }
 
+  /**
+   * Advance a watchdog run's recorded stop fingerprint after the run's own
+   * authorized mutation (for example withdrawing a pending interaction) legitimately
+   * changed the stop-fingerprint inputs.
+   *
+   * The caller must have just passed `revalidateMutationScope` for the same
+   * `scope.stopFingerprint`. The new fingerprint is only recorded when the subtree is
+   * still stopped, and only when the run still holds the fingerprint it was authorized
+   * with (compare-and-set). A change by another actor that lands in the short window
+   * between the revalidation and this call is absorbed; any change after it makes the
+   * next revalidation stale as before.
+   */
+  async function advanceMutationScopeFingerprint(
+    scope: {
+      kind: "watchdog";
+      watchdogId: string;
+      companyId: string;
+      watchedIssueId: string;
+      stopFingerprint: string | null;
+    },
+    runId: string,
+  ) {
+    if (!scope.stopFingerprint) return { advanced: false as const, reason: "missing_fingerprint" as const };
+    const watchdog = await db
+      .select()
+      .from(issueWatchdogs)
+      .where(and(
+        eq(issueWatchdogs.id, scope.watchdogId),
+        eq(issueWatchdogs.companyId, scope.companyId),
+        eq(issueWatchdogs.issueId, scope.watchedIssueId),
+        eq(issueWatchdogs.status, "active"),
+      ))
+      .then((rows) => rows[0] ?? null);
+    if (!watchdog) return { advanced: false as const, reason: "watchdog_inactive" as const };
+
+    const classification = classifyTaskWatchdogSubtree(await collectClassifierInput(watchdog.companyId, watchdog));
+    if (classification.state !== "stopped") return { advanced: false as const, reason: "not_stopped" as const };
+    const nextFingerprint = classification.stopFingerprint;
+    if (nextFingerprint === scope.stopFingerprint) return { advanced: false as const, reason: "unchanged" as const };
+
+    return db.transaction(async (tx) => {
+      const run = await tx
+        .select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, scope.companyId)))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!run) return { advanced: false as const, reason: "run_missing" as const };
+      const context = parseObject(run.contextSnapshot);
+      const taskWatchdog = parseObject(context.taskWatchdog);
+      const recorded = typeof taskWatchdog.stopFingerprint === "string"
+        ? taskWatchdog.stopFingerprint
+        : typeof context.stopFingerprint === "string"
+          ? context.stopFingerprint
+          : null;
+      if (recorded !== scope.stopFingerprint) return { advanced: false as const, reason: "run_fingerprint_moved" as const };
+      const nextContext: Record<string, unknown> = {
+        ...context,
+        taskWatchdog: { ...taskWatchdog, stopFingerprint: nextFingerprint },
+      };
+      if (typeof context.stopFingerprint === "string") nextContext.stopFingerprint = nextFingerprint;
+      await tx
+        .update(heartbeatRuns)
+        .set({ contextSnapshot: nextContext })
+        .where(eq(heartbeatRuns.id, runId));
+      return { advanced: true as const, from: scope.stopFingerprint, to: nextFingerprint };
+    });
+  }
+
   return {
     getActiveForIssue: async (companyId: string, issueId: string): Promise<IssueWatchdog | null> => {
       const row = await db
@@ -1811,5 +1880,6 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     },
 
     revalidateMutationScope,
+    advanceMutationScopeFingerprint,
   };
 }
