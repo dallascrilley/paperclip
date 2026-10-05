@@ -37,6 +37,7 @@ describe("replacement legacy host finalization", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
   let root: string;
+  let retainedUnpreparedRunId: string | null = null;
   const originalLogPath = process.env.RUN_LOG_BASE_PATH;
   const companyId = randomUUID(), agentId = randomUUID();
   beforeAll(async () => {
@@ -56,6 +57,7 @@ describe("replacement legacy host finalization", () => {
 
   it("holds historical or invalid preparation without claiming its controller or launching", async () => {
     const runId = randomUUID(), previousBootId = randomUUID();
+    retainedUnpreparedRunId = runId;
     const binding = { runId, companyId, agentId, adapterType: "codex_local" };
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "legacy",
       controllerBootId: previousBootId, controllerLeaseExpiresAt: sql`clock_timestamp() - interval '1 second'` });
@@ -181,7 +183,16 @@ describe("replacement legacy host finalization", () => {
         await db.update(heartbeatRuns).set({ status: "cancelled",
           resultJson: { executionCancellation: { state: "requested", requestedAt: new Date().toISOString() } },
         }).where(eq(heartbeatRuns.id, runId));
-        expect(await heartbeat.prepareHotRestartShutdown("SIGTERM")).toMatchObject({ skipDrain: true, activeRunIds: [] });
+        const shutdown = await heartbeat.prepareHotRestartShutdown("SIGTERM");
+        // The earlier invalid-preparation fixture remains running and requires drain.
+        // Joining this terminal worker must not erase that separate legacy obligation.
+        expect(shutdown).toMatchObject({
+          skipDrain: retainedUnpreparedRunId === null,
+          activeRunIds: retainedUnpreparedRunId === null ? [] : [retainedUnpreparedRunId],
+        });
+        if (retainedUnpreparedRunId !== null) {
+          expect(shutdown.drainReason).toBe("active_acp_run");
+        }
         expect(await readDurableChildResult(handle.directory)).not.toBeNull();
         await expect(fs.access(scratch.dir)).rejects.toThrow();
       }

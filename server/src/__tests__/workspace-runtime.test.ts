@@ -8,7 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parse as parseEnvContents } from "dotenv";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   activityLog,
   agents,
@@ -134,6 +134,57 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 const provisionWorktreeScriptPath = new URL("../../../scripts/provision-worktree.sh", import.meta.url);
+
+const fixtureEnvKeys = [
+  "PAPERCLIP_CONFIG", "PAPERCLIP_HOME", "PAPERCLIP_INSTANCE_ID",
+  "PAPERCLIP_WORKTREES_DIR", "DATABASE_URL", "PATH", "SHELL",
+] as const;
+const originalFixtureEnv = new Map(fixtureEnvKeys.map(key => [key, process.env[key]]));
+let fixtureRoot: string;
+let fixturePath: string | undefined;
+beforeAll(async () => {
+  fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "workspace-runtime-tools-"));
+  if (process.platform !== "win32") {
+    const bin = path.join(fixtureRoot, "bin");
+    await fs.mkdir(bin);
+    await fs.symlink(process.execPath, path.join(bin, "node"));
+    const candidates = [
+      process.env.npm_execpath && /pnpm/i.test(path.basename(process.env.npm_execpath))
+        ? process.env.npm_execpath : undefined,
+      ...(process.env.PATH ?? "").split(path.delimiter).map(dir => path.join(dir, "pnpm")),
+    ];
+    let pnpmEntry: string | undefined;
+    for (const candidate of candidates) {
+      if (!candidate || !existsSync(candidate)) continue;
+      const resolved = await fs.realpath(candidate);
+      if (/\.[cm]?js$/.test(resolved)) {
+        pnpmEntry = resolved;
+        break;
+      }
+    }
+    if (pnpmEntry) {
+      // Run the installed CLI with its normal entry-point semantics, without host shims.
+      await fs.writeFile(path.join(bin, "pnpm"),
+        `#!${process.execPath}\nconst { spawnSync } = require("node:child_process");\nconst result = spawnSync(process.execPath, [${JSON.stringify(pnpmEntry)}, ...process.argv.slice(2)], { stdio: "inherit" });\nprocess.exit(result.status ?? 1);\n`,
+        { mode: 0o755 });
+    } else {
+      const pnpm = (await execFileAsync("/bin/sh", ["-c", "command -v pnpm"])).stdout.trim();
+      await fs.symlink(pnpm, path.join(bin, "pnpm"));
+    }
+    fixturePath = [bin, "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(path.delimiter);
+  }
+});
+beforeEach(() => {
+  // Host CLI installs and shell startup files are not provisioning fixtures.
+  if (fixturePath) {
+    process.env.PATH = fixturePath;
+    process.env.SHELL = "/bin/sh";
+  }
+  process.env.PAPERCLIP_WORKTREES_DIR = path.join(fixtureRoot, "worktrees");
+});
+afterAll(async () => {
+  if (fixtureRoot) await fs.rm(fixtureRoot, { recursive: true, force: true });
+});
 
 async function runGit(cwd: string, args: string[]) {
   await execFileAsync("git", args, { cwd });
@@ -443,11 +494,11 @@ afterEach(async () => {
       leasedRunIds.delete(runId);
     }),
   );
-  delete process.env.PAPERCLIP_CONFIG;
-  delete process.env.PAPERCLIP_HOME;
-  delete process.env.PAPERCLIP_INSTANCE_ID;
-  delete process.env.PAPERCLIP_WORKTREES_DIR;
-  delete process.env.DATABASE_URL;
+  // Preserve the stable runner's isolated home/config across suites in this worker.
+  for (const [key, value] of originalFixtureEnv) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   await resetRuntimeServicesForTests();
 });
 
