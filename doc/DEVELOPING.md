@@ -1584,3 +1584,19 @@ disconnected, visible active queries refresh every 15 seconds. This fallback
 stops when the socket opens, the tab is hidden, or the provider unmounts. A
 reconnected socket also refreshes visible queries to recover missed events.
 Run log views retain their existing HTTP polling fallback.
+
+
+## Local resource admission probe
+
+The source candidate `scripts/probe-local-resource-admission.py` checks the existing LocalModelGuard and shared heavy-job lock. It starts no provider process. It changes no service configuration.
+
+```sh
+python3 scripts/probe-local-resource-admission.py --required-gib 4 --timeout 2
+python3 scripts/__tests__/test-local-resource-admission.py
+```
+
+Exit 0 means that the guard reported normal pressure, sufficient available memory, no active model, and an available job gate. Exit 75 means defer. Unknown readiness, invalid responses, missing or unsafe lock files, active inference, and a held gate all prevent admission. Requests stay on the numeric loopback address and do not follow redirects or use a proxy. Output contains fixed reason codes and numeric memory fields.
+
+A pass is a snapshot. The probe holds the existing gate only through its health request. It does not reserve memory, launch a worker, or resume a task. The native integration must reserve capacity across simultaneous starts, recheck before provider dispatch, and use the existing scheduled retry path. It must preserve task ownership and existing processes on restart. Do not treat this helper alone as installed worker protection.
+
+The five small HTTP and OS-lock fixtures passed in under one second, with about 21 MiB maximum RSS. They verify pressure recovery, lock exclusion and release, insufficient headroom, active inference, malformed responses, unsafe targets, and outages. They use a temporary lock and synthetic guard. They do not establish native queuing, cross-harness execution, or installed delivery. The real shared gate returned `heavy_job_busy`. Full repository checks and native acceptance remain pending behind resource admission.
