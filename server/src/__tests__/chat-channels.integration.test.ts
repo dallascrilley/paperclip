@@ -15352,13 +15352,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     // Simulate another server process reconciling the same durable rows at
     // the same time as the webhook process's deferred drain.
     await competingService.processPendingDeliveries();
+    // The database-backed drain commits eight comments and wakes serially.
+    // Keep the wait bounded without applying the default one-second UI budget.
     await vi.waitFor(async () => {
       const rows = await db
         .select()
         .from(chatConversations)
         .where(eq(chatConversations.endpointId, endpoint.id));
       expect(rows).toHaveLength(1);
-    });
+    }, { timeout: 5_000 });
     const [conversation] = await db
       .select()
       .from(chatConversations)
@@ -15369,7 +15371,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         .from(issueComments)
         .where(eq(issueComments.issueId, conversation.issueId));
       expect(rows).toHaveLength(8);
-    });
+    }, { timeout: 5_000 });
     const comments = await db
       .select({ id: issueComments.id, body: issueComments.body })
       .from(issueComments)
@@ -15396,7 +15398,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(calls.map((call) => call[1]?.payload?.wakeCommentId)).toEqual(
         comments.map((comment) => comment.id),
       );
-    });
+    }, { timeout: 5_000 });
     // The last comment and wakeup commit inside the lease. Under full-suite
     // load the assertions above can observe those effects one microtask before
     // the deferred owner's `finally` deletes its lease. Require prompt eventual
@@ -15408,7 +15410,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           .from(chatEndpointLeases)
           .where(eq(chatEndpointLeases.endpointId, endpoint.id)),
       ).toHaveLength(0);
-    });
+    }, { timeout: 5_000 });
     await competingService.shutdown();
     await service.shutdown();
   });
@@ -61033,7 +61035,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(
         deliveries.every((delivery) => delivery.state === "processed"),
       ).toBe(true);
-    });
+    }, { timeout: 5_000 });
 
     const [conversation] = await db
       .select()
