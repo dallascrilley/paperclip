@@ -255,6 +255,7 @@ describe("managed install commands", () => {
       expect(fs.existsSync(paths.shimPath)).toBe(true);
     });
     await uninstallCommand({
+      userHomeDir: process.env.HOME!,
       detectServiceManager: vi.fn(async () => ({
         supported: true as const,
         manager: {
@@ -335,7 +336,10 @@ describe("managed install commands", () => {
     fs.mkdirSync(paths.cliRoot, { recursive: true });
     fs.writeFileSync(unrelatedFile, "keep");
 
-    await expect(uninstallCommand()).rejects.toThrow("unverified install store");
+    await expect(uninstallCommand({
+      userHomeDir: process.env.HOME!,
+      detectServiceManager: vi.fn(async () => ({ supported: false as const, reason: "fixture has no service" })),
+    })).rejects.toThrow("unverified install store");
     expect(fs.readFileSync(unrelatedFile, "utf8")).toBe("keep");
   });
 
@@ -357,7 +361,10 @@ describe("managed install commands", () => {
 
     await withInstallStoreLock(
       async () => {
-        await expect(uninstallCommand()).rejects.toThrow("already running");
+        await expect(uninstallCommand({
+          userHomeDir: process.env.HOME!,
+          detectServiceManager: vi.fn(async () => ({ supported: false as const, reason: "fixture has no service" })),
+        })).rejects.toThrow("already running");
       },
       paths,
     );

@@ -377,9 +377,10 @@ describe("sandbox callback bridge", () => {
     const queueDir = path.posix.join(rootDir, "queue");
     const directories = sandboxCallbackBridgeDirectories(queueDir);
     const processed: string[] = [];
+    const client = createFileSystemSandboxCallbackBridgeQueueClient();
 
     const worker = await startSandboxCallbackBridgeWorker({
-      client: createFileSystemSandboxCallbackBridgeQueueClient(),
+      client,
       queueDir,
       authorizeRequest: async () => null,
       handleRequest: async (request) => {
@@ -392,7 +393,9 @@ describe("sandbox callback bridge", () => {
       },
     });
 
-    await writeFile(
+    // Publish envelopes atomically, as the gateway does, so the poll loop
+    // cannot observe an empty or partially written JSON request.
+    await client.writeTextFile(
       path.posix.join(directories.requestsDir, "req-a.json"),
       `${JSON.stringify({
         id: "req-a",
@@ -403,9 +406,8 @@ describe("sandbox callback bridge", () => {
         body: "",
         createdAt: new Date().toISOString(),
       })}\n`,
-      "utf8",
     );
-    await writeFile(
+    await client.writeTextFile(
       path.posix.join(directories.requestsDir, "req-b.json"),
       `${JSON.stringify({
         id: "req-b",
@@ -416,7 +418,6 @@ describe("sandbox callback bridge", () => {
         body: "",
         createdAt: new Date().toISOString(),
       })}\n`,
-      "utf8",
     );
 
     await worker.stop({ drainTimeoutMs: 1_000 });

@@ -97,6 +97,10 @@ describe("cli telemetry", () => {
   });
 
   it("creates telemetry state only after the first event is tracked", async () => {
+    // This enabled-state fixture uses mocked fetch. Host opt-out preferences
+    // must not select the disabled branch that the preceding test covers.
+    delete process.env.PAPERCLIP_TELEMETRY_DISABLED;
+    delete process.env.DO_NOT_TRACK;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-cli-telemetry-"));
     process.env.PAPERCLIP_HOME = path.join(root, "home");
     process.env.PAPERCLIP_INSTANCE_ID = "telemetry-test";

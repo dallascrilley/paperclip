@@ -2,10 +2,22 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { doctor } from "../commands/doctor.js";
 import { writeConfig } from "../config/store.js";
 import type { PaperclipConfig } from "../config/schema.js";
+import { serviceHealthChecks } from "../checks/service-health-check.js";
+
+// Repair orchestration must not query the host's installed service. Dedicated
+// service-health-check tests exercise service detection and health diagnostics.
+vi.mock("../checks/service-health-check.js", () => ({
+  serviceHealthChecks: vi.fn(async () => []),
+}));
+vi.mock("../checks/managed-install-check.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../checks/managed-install-check.js")>(),
+  managedInstallChecks: vi.fn(() => []),
+}));
+vi.mock("../update-notice.js", () => ({ printUpdateNotice: vi.fn() }));
 
 const ORIGINAL_ENV = { ...process.env };
 
@@ -88,6 +100,7 @@ function createTempConfig(serverPort: number): string {
 
 describe("doctor", () => {
   beforeEach(() => {
+    vi.clearAllMocks();
     process.env = { ...ORIGINAL_ENV };
     delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
     delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
@@ -110,5 +123,6 @@ describe("doctor", () => {
     expect(summary.failed).toBe(0);
     expect(summary.warned).toBe(0);
     expect(process.env.PAPERCLIP_AGENT_JWT_SECRET).toBeTruthy();
+    expect(serviceHealthChecks).toHaveBeenCalledOnce();
   });
 });
