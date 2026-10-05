@@ -14440,6 +14440,12 @@ export function heartbeatService(
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
       .where(eq(heartbeatRuns.status, "running"));
+    // Terminal rows can still have an attached reader consuming a Stop receipt.
+    // They cannot transfer a running lease, so settle those owned readers before
+    // writing a preservation snapshot. This does not relaunch provider work.
+    const terminalSettlements = [...activeRunExecutions].filter(runId =>
+      !activeRuns.some(({ run }) => run.id === runId));
+    await Promise.all(terminalSettlements.map(runId => adapterExecutionControls.get(runId)?.settled).filter(Boolean));
     const snapshotRuns = activeRuns.map(toHotRestartIntentRun);
     const intentWithVersion = {
       ...intent,
@@ -20271,6 +20277,10 @@ export function heartbeatService(
     if (!agent || !custody || custody.companyId !== run.companyId || custody.agentId !== run.agentId ||
         custody.adapterType !== agent.adapterType || custody.adapterType !== "codex_local" || !custody.preparedFinalizationJson) return false;
     const preparation = prepareLegacyAdapterFinalizationInputs(custody.preparedFinalizationJson as LegacyAdapterFinalizationInputs);
+    if (preparation.scratch && (preparation.scratch.metadata.companyId !== run.companyId ||
+        preparation.scratch.metadata.agentId !== run.agentId || preparation.scratch.metadata.runId !== runId)) {
+      throw new Error("Recovered scratch binding mismatch");
+    }
     if (preparation.managedAiCleanup && preparation.managedAiCleanup.companyId !== run.companyId) {
       throw new Error("Managed AI cleanup company binding mismatch");
     }
@@ -20412,26 +20422,39 @@ export function heartbeatService(
         logger.warn({ err: error, runId }, "replacement legacy consumer detached; custody retained");
       } finally {
         lease.stop();
-        activeRunExecutions.delete(runId);
-        control.finish();
-        if (adapterExecutionControls.get(runId) === control) adapterExecutionControls.delete(runId);
-        const latest = await getRun(runId).catch(() => null);
-        if (workerTerminalConsumed && latest && latest.controllerBootId === legacyControllerBootId && isHeartbeatRunTerminalStatus(latest.status)) {
-          if (preparation.managedAiCleanup) await cleanupManagedAiRuntime(db, {
-            root: path.join(instanceRoot, "data", "managed-ai-homes", run.companyId),
-            descriptor: preparation.managedAiCleanup,
-          }).catch(error => logger.warn({ err: error, runId }, "recovered managed AI refresh or cleanup failed"));
-          await revokeHeartbeatRunGatewayTokens({ db, companyId: run.companyId, runId }).catch(error =>
-            logger.warn({ err: error, runId }, "recovered legacy gateway-token cleanup failed"));
-          await db.update(heartbeatRuns).set({ executionControlDeadlineAt: null }).where(and(
-            eq(heartbeatRuns.id, runId), eq(heartbeatRuns.controllerBootId, legacyControllerBootId),
-            eq(heartbeatRuns.status, latest.status),
-          )).catch(error => logger.warn({ err: error, runId }, "recovered legacy deadline cleanup failed"));
-          await releaseEnvironmentLeasesForRun({ runId, companyId: run.companyId, agentId: run.agentId,
-            status: latest.status, failureReason: latest.error ?? undefined }).catch(error =>
-              logger.warn({ err: error, runId }, "recovered legacy environment cleanup failed"));
-          await releaseRuntimeServicesForRun(runId).catch(error =>
-            logger.warn({ err: error, runId }, "recovered legacy runtime cleanup failed"));
+        try {
+          const latest = await getRun(runId).catch(() => null);
+          if (workerTerminalConsumed && latest && latest.controllerBootId === legacyControllerBootId && isHeartbeatRunTerminalStatus(latest.status)) {
+            if (preparation.scratch) {
+              try {
+                const cleanup = await cleanupHeartbeatRunScratch({ scratch: { ...preparation.scratch,
+                  markerPath: path.join(preparation.scratch.dir, HEARTBEAT_RUN_SCRATCH_MARKER) },
+                  processGroupId: latest.processGroupId, isProcessGroupAlive });
+                await appendRunEvent(latest, { eventType: "lifecycle", stream: "system",
+                  level: cleanup.removed ? "info" : "warn", message: cleanup.removed
+                    ? "run scratch cleaned" : `run scratch cleanup skipped: ${cleanup.reason}`, payload: cleanup });
+              } catch (error) { logger.warn({ err: error, runId }, "recovered run scratch cleanup failed"); }
+            }
+            if (preparation.managedAiCleanup) await cleanupManagedAiRuntime(db, {
+              root: path.join(instanceRoot, "data", "managed-ai-homes", run.companyId),
+              descriptor: preparation.managedAiCleanup,
+            }).catch(error => logger.warn({ err: error, runId }, "recovered managed AI refresh or cleanup failed"));
+            await revokeHeartbeatRunGatewayTokens({ db, companyId: run.companyId, runId }).catch(error =>
+              logger.warn({ err: error, runId }, "recovered legacy gateway-token cleanup failed"));
+            await db.update(heartbeatRuns).set({ executionControlDeadlineAt: null }).where(and(
+              eq(heartbeatRuns.id, runId), eq(heartbeatRuns.controllerBootId, legacyControllerBootId),
+              eq(heartbeatRuns.status, latest.status),
+            )).catch(error => logger.warn({ err: error, runId }, "recovered legacy deadline cleanup failed"));
+            await releaseEnvironmentLeasesForRun({ runId, companyId: run.companyId, agentId: run.agentId,
+              status: latest.status, failureReason: latest.error ?? undefined }).catch(error =>
+                logger.warn({ err: error, runId }, "recovered legacy environment cleanup failed"));
+            await releaseRuntimeServicesForRun(runId).catch(error =>
+              logger.warn({ err: error, runId }, "recovered legacy runtime cleanup failed"));
+        }
+        } finally {
+          activeRunExecutions.delete(runId);
+          control.finish();
+          if (adapterExecutionControls.get(runId) === control) adapterExecutionControls.delete(runId);
         }
       }
     })();
@@ -25295,6 +25318,7 @@ export function heartbeatService(
                       secretValues: await createRunSecretRedactionRegistry(db).resolveValuesForRun(run.companyId, run.id),
                       preparedFinalization: {
                         version: 1, taskKey, issueId, configuredModel,
+                        scratch: runScratch ? { dir: runScratch.dir, metadata: runScratch.metadata } : null,
                         managedAiCleanup: managedAiRuntime?.cleanupDescriptor ?? null,
                         workspace: { executionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
                           cwd: executionWorkspace.cwd, worktreePath: executionWorkspace.worktreePath ?? null,
@@ -26334,6 +26358,7 @@ export function heartbeatService(
         }
         if (
           runScratch &&
+          !legacyControllerDetached &&
           latestRun &&
           isHeartbeatRunTerminalStatus(latestRun.status)
         ) {

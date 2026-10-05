@@ -294,10 +294,15 @@ worker terminal receipt. Lost transport authority leaves that home intact. A Sto
 consumer records the bound exit tail without reviving the cancelled row. Running
 event ingestion still requires a live lease; cancelled tail ingestion requires
 the same company, agent, custody, cursor and controller identity. Replacement
-resource cleanup requires a consumed worker terminal receipt. A replacement
+resource cleanup requires a consumed worker terminal receipt. Host preparation
+also saves the run scratch owner and path. The replacement uses the existing
+scratch-marker and live-process-group checks before removal. The outgoing host
+waits for locally owned terminal readers to settle their receipts and cleanup
+before publishing a restart snapshot; terminal rows cannot transfer running
+controller leases. A replacement
 reader also consumes a persisted Stop request while the run is still running;
 it joins the same worker and finalizes cancelled. Recovery when the controller
-disappears after the row is already cancelled remains to be verified. Native
+disappears abruptly after the row is already cancelled remains to be verified. Native
 source approval, full project gates and separate disposable installed restart
 proof remain required before a corrective activation handoff.
 

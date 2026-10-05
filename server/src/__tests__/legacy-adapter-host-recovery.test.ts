@@ -1,5 +1,6 @@
-const restart = vi.hoisted(() => ({ readIntent: vi.fn(), writeReport: vi.fn(async (input: unknown) => input), removeIntent: vi.fn(async () => {}) }));
+const restart = vi.hoisted(() => ({ readIntent: vi.fn(), writeSnapshot: vi.fn(async (input: unknown) => input), writeReport: vi.fn(async (input: unknown) => input), removeIntent: vi.fn(async () => {}) }));
 import { heartbeatService } from "../services/heartbeat.js";
+import { prepareHeartbeatRunScratch } from "../services/run-scratch.js";
 import { legacyControllerBootId } from "../services/legacy-controller-lease.js";
 import { preparedFinalizationFixture } from "./legacy-adapter-finalization-inputs.fixture.js";
 import fs from "node:fs/promises";
@@ -18,7 +19,7 @@ import { startLegacyAdapterWorker, cancelLegacyAdapterWorker } from "../services
 
 vi.mock("../services/hot-restart.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../services/hot-restart.js")>();
-  return { ...actual, readHotRestartIntent: restart.readIntent,
+  return { ...actual, readHotRestartIntent: restart.readIntent, writeHotRestartShutdownSnapshot: restart.writeSnapshot,
     writeHotRestartReport: restart.writeReport, removeHotRestartIntent: restart.removeIntent };
 });
 
@@ -69,7 +70,7 @@ describe("replacement legacy host finalization", () => {
     expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId))).toHaveLength(0);
   });
 
-  it.each(["sleeping", "logging", "cancelled", "pending_stop", "branch_mismatch"] as const)("finalizes the same %s Codex executor through common host session and usage projection", async mode => {
+  it.each(["sleeping", "logging", "cancelled", "pending_stop", "terminal_stop", "branch_mismatch"] as const)("finalizes the same %s Codex executor through common host session and usage projection", async mode => {
     const runId = randomUUID(), previousBootId = randomUUID(), replacementBootId = legacyControllerBootId;
     const binding = { runId, companyId, agentId, adapterType: "codex_local" };
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "legacy",
@@ -101,6 +102,8 @@ describe("replacement legacy host finalization", () => {
       homeName: path.basename(managedHome), ownershipToken: randomUUID(), provider: "openai",
       subscriptionFile: false, originalCredentialHash: "0".repeat(64) };
     await fs.writeFile(path.join(managedHome, ".paperclip-managed-ai-home.json"), JSON.stringify(preparation.managedAiCleanup));
+    const scratch = await prepareHeartbeatRunScratch({ ...binding });
+    preparation.scratch = { dir: scratch.dir, metadata: scratch.metadata };
     const custody = await reserveLegacyAdapterCustody(db, binding, previousBootId, preparation);
     const home = path.join(work, "home"), codexHome = path.join(work, "codex");
     await fs.mkdir(home); await fs.mkdir(codexHome);
@@ -152,6 +155,7 @@ describe("replacement legacy host finalization", () => {
       expect(before.processPid).toBeGreaterThan(0);
       process.kill(before.processPid!, 0);
       expect((await fs.stat(managedHome)).isDirectory()).toBe(true);
+      expect((await fs.stat(scratch.dir)).isDirectory()).toBe(true);
       expect(await fs.readFile(effects, "utf8")).toBe("started\n");
       const heartbeat = heartbeatService(db, { legacyAdapterWorkerInstanceRoot: root });
       expect(await heartbeat.resumeSupervisedLegacyRun(runId)).toBe(false);
@@ -173,12 +177,21 @@ describe("replacement legacy host finalization", () => {
       const adoption = await heartbeat.reconcileHotRestartAdoption();
       expect(adoption).toMatchObject({ mode: "reported", adoptedRunIds: [runId], lostRunIds: [], skippedRunIds: [] });
       expect(await heartbeat.resumeSupervisedLegacyRun(runId)).toBe(false);
-      if (mode === "cancelled") await heartbeat.cancelRun(runId, "Stop recovered fixture");
+      if (mode === "terminal_stop") {
+        await db.update(heartbeatRuns).set({ status: "cancelled",
+          resultJson: { executionCancellation: { state: "requested", requestedAt: new Date().toISOString() } },
+        }).where(eq(heartbeatRuns.id, runId));
+        expect(await heartbeat.prepareHotRestartShutdown("SIGTERM")).toMatchObject({ skipDrain: true, activeRunIds: [] });
+        expect(await readDurableChildResult(handle.directory)).not.toBeNull();
+        await expect(fs.access(scratch.dir)).rejects.toThrow();
+      }
+      else if (mode === "cancelled") await heartbeat.cancelRun(runId, "Stop recovered fixture");
       else if (mode !== "pending_stop") await fs.writeFile(release, "");
       await heartbeat.drainActiveRunExecutions();
       await expect(fs.access(managedHome)).rejects.toThrow();
+      await expect(fs.access(scratch.dir)).rejects.toThrow();
       const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-      expect(after).toMatchObject({ status: (mode === "cancelled" || mode === "pending_stop") ? "cancelled" : mode === "branch_mismatch" ? "failed" : "succeeded", processPid: before.processPid, processGroupId: before.processGroupId,
+      expect(after).toMatchObject({ status: (mode === "cancelled" || mode === "pending_stop" || mode === "terminal_stop") ? "cancelled" : mode === "branch_mismatch" ? "failed" : "succeeded", processPid: before.processPid, processGroupId: before.processGroupId,
         controllerBootId: replacementBootId });
       const [tail] = await db.select().from(legacyAdapterTransports).where(eq(legacyAdapterTransports.runId, runId));
       expect(tail.eventCursor).toBeGreaterThan(previousCustody.eventCursor);
@@ -188,7 +201,7 @@ describe("replacement legacy host finalization", () => {
       const log = await heartbeat.readLog(runId, { limitBytes: 1024 * 1024 });
       expect(log.content).toContain("thread.started");
       expect(after.stdoutExcerpt).toContain("thread.started");
-      if (mode === "cancelled" || mode === "pending_stop") {
+      if (mode === "cancelled" || mode === "pending_stop" || mode === "terminal_stop") {
         expect(after).toMatchObject({ status: "cancelled", sessionIdAfter: "reattached-session",
           resultJson: { executionCancellation: { state: "acknowledged", proof: "durable_adapter_worker_join",
             custodyId: custody.custodyId } } });
@@ -225,6 +238,7 @@ describe("replacement legacy host finalization", () => {
     } finally {
       await cancelLegacyAdapterWorker(handle.directory);
       await wait(() => readDurableChildResult(handle.directory), receipt => receipt !== null);
+      await fs.rm(scratch.dir, { recursive: true, force: true });
     }
   }, 90000);
 });

@@ -32,6 +32,10 @@ async function lockOwnedRun(tx: Transaction, binding: Binding, bootId: string, a
 export async function reserveLegacyAdapterCustody(db: Db, binding: Binding, bootId: string = legacyControllerBootId,
   preparedFinalizationJson?: LegacyAdapterFinalizationInputs) {
   const preparation = preparedFinalizationJson ? prepareLegacyAdapterFinalizationInputs(preparedFinalizationJson) : undefined;
+  if (preparation?.scratch && (preparation.scratch.metadata.companyId !== binding.companyId ||
+    preparation.scratch.metadata.agentId !== binding.agentId || preparation.scratch.metadata.runId !== binding.runId)) {
+    throw new Error("Legacy scratch binding mismatch");
+  }
   if (!SUPERVISED_LEGACY_ADAPTERS.has(binding.adapterType)) throw new Error("Unsupported legacy adapter custody");
   return db.transaction(async tx => {
     if (!await lockOwnedRun(tx, binding, bootId)) throw new Error("Legacy adapter custody ownership lost");

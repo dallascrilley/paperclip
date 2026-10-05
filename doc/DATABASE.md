@@ -491,3 +491,9 @@ no credential value. The instance-owned home root is derived by the replacement
 controller. Cleanup validates the home marker before refresh or removal and uses
 the existing grant/secret locking and provider freshness merge. A consumed worker
 terminal receipt is required before replacement cleanup.
+
+The host preparation saves the run scratch path and original owner metadata.
+Reservation and replacement validate company, agent and run identity; terminal
+cleanup uses the existing marker and process-group checks. A detached reader
+cannot remove the scratch directory. Supported shutdown waits for terminal
+readers to finish receipt consumption and cleanup before snapshot publication.

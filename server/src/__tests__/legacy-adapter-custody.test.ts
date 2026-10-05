@@ -43,6 +43,16 @@ describe("legacy transport database custody", () => {
     expect(replacement?.custody.preparedFinalizationJson).toEqual(preparation);
   });
 
+  it("rejects scratch preparation owned by another company before changing custody", async () => {
+    const f = await fixture();
+    const preparation = { ...preparedFinalizationFixture(), scratch: { dir: "/unused/paperclip-run-fixture",
+      metadata: { version: 1 as const, companyId: randomUUID(), agentId, runId: f.runId,
+        issueId: null, issueIdentifier: null, createdAt: new Date().toISOString() } } };
+    await expect(reserveLegacyAdapterCustody(db, f, undefined, preparation)).rejects.toThrow("scratch binding mismatch");
+    const [custody] = await db.select().from(legacyAdapterTransports).where(eq(legacyAdapterTransports.runId, f.runId));
+    expect(custody.preparedFinalizationJson).toBeNull();
+  });
+
   it("does not retrofit prepared finalization into previously reserved custody", async () => {
     const f = await fixture();
     await expect(reserveLegacyAdapterCustody(db, f, undefined, preparedFinalizationFixture())).rejects.toThrow("preparation mismatch");
