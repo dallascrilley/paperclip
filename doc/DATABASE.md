@@ -449,6 +449,13 @@ failure or lease expiry during ingestion rolls back the entire batch. Hosts must
 apply run-log redaction and payload limits before insertion and publish live
 events only after commit.
 
-This custody layer is a source checkpoint. Heartbeat dispatch, controller
-replacement and terminal run finalization do not use it yet. Its presence does
-not establish active-run adoption or installed hot-restart acceptance.
+The opt-in heartbeat dispatch uses this custody layer. A replacement consumer
+can claim an expired lease under the same run and custody locks. It must match
+the previous boot, company, agent, adapter and custody ID. Concurrent replacements
+produce one owner, retain the executor identity and byte cursor, and record a
+`legacy_adapter_custody_claimed` run event in the transfer transaction. This
+permits consumption of the existing spool; it permits no new executor launch.
+
+Heartbeat restart routing and prepared terminal finalization remain incomplete.
+These source checkpoints do not establish active-run adoption or installed
+hot-restart acceptance.

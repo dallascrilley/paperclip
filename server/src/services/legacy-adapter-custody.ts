@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, gt, sql } from "drizzle-orm";
+import { and, eq, gt, lte, sql } from "drizzle-orm";
 import { agents, heartbeatRuns, legacyAdapterTransports, type Db } from "@paperclipai/db";
 import { legacyControllerBootId } from "./legacy-controller-lease.js";
 import { appendHeartbeatRunEvent, type AppendHeartbeatRunEventInput } from "./heartbeat-run-events.js";
@@ -26,7 +26,7 @@ async function lockOwnedRun(tx: Transaction, binding: Binding, bootId: string) {
 /** Before any supervised spawn. Repeated reservation reuses custody, never
  * permits another launch; the spool's exclusive directory is the launch gate.
  */
-export async function reserveLegacyAdapterCustody(db: Db, binding: Binding, bootId = legacyControllerBootId) {
+export async function reserveLegacyAdapterCustody(db: Db, binding: Binding, bootId: string = legacyControllerBootId) {
   if (!SUPERVISED_LEGACY_ADAPTERS.has(binding.adapterType)) throw new Error("Unsupported legacy adapter custody");
   return db.transaction(async tx => {
     if (!await lockOwnedRun(tx, binding, bootId)) throw new Error("Legacy adapter custody ownership lost");
@@ -42,6 +42,55 @@ export async function reserveLegacyAdapterCustody(db: Db, binding: Binding, boot
   });
 }
 
+/** Transfer consumption authority for an existing spool after lease expiry.
+ * This grants neither dispatch nor an adoption classification. The caller must
+ * validate the bound spool and recover prepared finalization inputs separately.
+ * Lock order matches ingestion: run, then custody. A live controller cannot be
+ * displaced, and concurrent replacements cannot both acquire the same run.
+ */
+export async function claimExpiredLegacyAdapterCustody(db: Db, input: Binding & {
+  custodyId: string;
+  previousBootId: string;
+}, replacementBootId: string = legacyControllerBootId) {
+  if (!SUPERVISED_LEGACY_ADAPTERS.has(input.adapterType) ||
+      !input.previousBootId || !replacementBootId || input.previousBootId === replacementBootId) return null;
+  return db.transaction(async tx => {
+    const [run] = await tx.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId),
+      eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.runtimeMode, "legacy"),
+      eq(heartbeatRuns.status, "running"), eq(heartbeatRuns.controllerBootId, input.previousBootId),
+      lte(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`),
+    )).for("update");
+    if (!run) return null;
+    const [agent] = await tx.select({ adapterType: agents.adapterType }).from(agents).where(and(
+      eq(agents.id, input.agentId), eq(agents.companyId, input.companyId),
+    ));
+    if (agent?.adapterType !== input.adapterType) return null;
+    const [custody] = await tx.select().from(legacyAdapterTransports).where(and(
+      eq(legacyAdapterTransports.runId, input.runId), eq(legacyAdapterTransports.companyId, input.companyId),
+      eq(legacyAdapterTransports.agentId, input.agentId), eq(legacyAdapterTransports.adapterType, input.adapterType),
+      eq(legacyAdapterTransports.custodyId, input.custodyId),
+    )).for("update");
+    if (!custody) return null;
+    const [claimed] = await tx.update(heartbeatRuns).set({
+      controllerBootId: replacementBootId,
+      controllerLeaseExpiresAt: sql`clock_timestamp() + interval '60 seconds'`,
+    }).where(and(eq(heartbeatRuns.id, input.runId),
+      eq(heartbeatRuns.controllerBootId, input.previousBootId),
+      lte(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`),
+    )).returning();
+    if (!claimed) return null;
+    const event = await appendHeartbeatRunEvent(tx as unknown as Db, {
+      runId: input.runId, companyId: input.companyId, agentId: input.agentId,
+      eventType: "legacy_adapter_custody_claimed", level: "info",
+      message: "Replacement controller acquired expired transport custody",
+      payload: { previousBootId: input.previousBootId, replacementBootId,
+        custodyId: input.custodyId, eventCursor: custody.eventCursor },
+    });
+    return { run: { ...claimed, nextEventSeq: event.row.seq + 1 }, custody };
+  });
+}
+
 /** SQL-only ingestion. The projection must be pure and apply host redaction /
  * payload limits before insertion. The caller publishes committed rows after
  * this transaction; no live callback, file append or executor runs inside it.
@@ -54,7 +103,7 @@ export async function commitLegacyAdapterEvents(db: Db, input: Binding & {
   events: LegacyAdapterWorkerEvent[];
   project: (event: LegacyAdapterWorkerEvent) => Pick<AppendHeartbeatRunEventInput,
     "eventType" | "stream" | "level" | "color" | "message" | "payload">;
-}, bootId = legacyControllerBootId) {
+}, bootId: string = legacyControllerBootId) {
   if (![input.expectedCursor, input.nextCursor].every(value => Number.isSafeInteger(value) && value >= 0) ||
       input.nextCursor < input.expectedCursor || (input.events.length > 0 && input.nextCursor === input.expectedCursor) ||
       (input.events.length === 0 && input.nextCursor !== input.expectedCursor)) {

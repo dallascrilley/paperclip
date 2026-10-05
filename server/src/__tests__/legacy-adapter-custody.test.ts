@@ -3,7 +3,7 @@ import { beforeAll, afterAll, describe, expect, it } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import { agents, companies, heartbeatRuns, heartbeatRunEvents, legacyAdapterTransports, createDb } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { reserveLegacyAdapterCustody, commitLegacyAdapterEvents } from "../services/legacy-adapter-custody.js";
+import { reserveLegacyAdapterCustody, commitLegacyAdapterEvents, claimExpiredLegacyAdapterCustody } from "../services/legacy-adapter-custody.js";
 import { legacyControllerBootId } from "../services/legacy-controller-lease.js";
 import type { LegacyAdapterWorkerEvent } from "../services/legacy-adapter-events.js";
 import { terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
@@ -65,10 +65,54 @@ describe("legacy transport database custody", () => {
     expect(await commitLegacyAdapterEvents(db, f)).toBeNull();
     await expect(reserveLegacyAdapterCustody(db, f)).rejects.toThrow("ownership lost");
     const replacementBoot = randomUUID();
-    await db.update(heartbeatRuns).set({ controllerBootId: replacementBoot, controllerLeaseExpiresAt: sql`clock_timestamp() + interval '60 seconds'` }).where(eq(heartbeatRuns.id, f.runId));
+    expect(await claimExpiredLegacyAdapterCustody(db, { ...f, previousBootId: legacyControllerBootId }, replacementBoot)).not.toBeNull();
     expect(await commitLegacyAdapterEvents(db, f)).toBeNull();
     expect(await commitLegacyAdapterEvents(db, f, replacementBoot)).not.toBeNull();
-    expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.runId))).toHaveLength(1);
+    const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.runId));
+    expect(events).toHaveLength(2);
+    expect(events.filter(event => event.eventType === "legacy_adapter_custody_claimed")).toHaveLength(1);
+  });
+
+  it("retains the cursor and executor identity with exactly one concurrent replacement", async () => {
+    const f = await fixture();
+    const spawn = { pid: 1234, processGroupId: 1234, startedAt: new Date().toISOString() };
+    await commitLegacyAdapterEvents(db, { ...f, events: [{ kind: "spawn", meta: spawn }] });
+    const input = { ...f, previousBootId: legacyControllerBootId };
+    const boots = [randomUUID(), randomUUID()];
+    expect(await claimExpiredLegacyAdapterCustody(db, input, boots[0])).toBeNull();
+    await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: sql`clock_timestamp() - interval '1 second'` }).where(eq(heartbeatRuns.id, f.runId));
+    const results = await Promise.all(boots.map(boot => claimExpiredLegacyAdapterCustody(db, input, boot)));
+    expect(results.filter(Boolean)).toHaveLength(1);
+    const winner = results.findIndex(Boolean);
+    expect(results[winner]).toMatchObject({
+      run: { controllerBootId: boots[winner], processPid: spawn.pid, processGroupId: spawn.processGroupId, status: "running" },
+      custody: { custodyId: f.custodyId, eventCursor: 20 },
+    });
+    expect(await commitLegacyAdapterEvents(db, { ...f, expectedCursor: 20, nextCursor: 40 })).toBeNull();
+    expect(await commitLegacyAdapterEvents(db, { ...f, expectedCursor: 20, nextCursor: 40 }, boots[1 - winner])).toBeNull();
+    expect(await commitLegacyAdapterEvents(db, { ...f, expectedCursor: 20, nextCursor: 40 }, boots[winner])).not.toBeNull();
+    console.info("legacy-custody-transfer-proof", JSON.stringify({ runId: f.runId, custodyId: f.custodyId,
+      previousBootId: legacyControllerBootId, replacementBootId: boots[winner], successfulClaims: 1, cursor: 40 }));
+  });
+
+  it("rejects missing, mismatched, terminal and native custody without changing ownership", async () => {
+    const f = await fixture();
+    const input = { ...f, previousBootId: legacyControllerBootId };
+    const boot = randomUUID();
+    await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: sql`clock_timestamp() - interval '1 second'` }).where(eq(heartbeatRuns.id, f.runId));
+    for (const mismatch of [{ companyId: randomUUID() }, { agentId: randomUUID() },
+      { custodyId: randomUUID() }, { previousBootId: randomUUID() }, { adapterType: "claude_local" }]) {
+      expect(await claimExpiredLegacyAdapterCustody(db, { ...input, ...mismatch }, boot)).toBeNull();
+    }
+    expect(await claimExpiredLegacyAdapterCustody(db, input, legacyControllerBootId)).toBeNull();
+    await db.update(heartbeatRuns).set({ runtimeMode: "native" }).where(eq(heartbeatRuns.id, f.runId));
+    expect(await claimExpiredLegacyAdapterCustody(db, input, boot)).toBeNull();
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "succeeded" }).where(eq(heartbeatRuns.id, f.runId));
+    expect(await claimExpiredLegacyAdapterCustody(db, input, boot)).toBeNull();
+    await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, f.runId));
+    await db.delete(legacyAdapterTransports).where(eq(legacyAdapterTransports.runId, f.runId));
+    expect(await claimExpiredLegacyAdapterCustody(db, input, boot)).toBeNull();
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0].controllerBootId).toBe(legacyControllerBootId);
   });
 
   it("rolls back the entire batch if database-clock authority expires during projection", async () => {

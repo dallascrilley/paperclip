@@ -266,8 +266,10 @@ worker cleanup; lost controller authority preserves the worker and custody.
 The flag is off by default and does not select remote or ACP execution.
 
 This flag is an implementation checkpoint, not an active-restart activation
-route. Immutable host finalization inputs, replacement lease transfer and result
-reattachment remain required. The selective restart drain still applies to these
+route. A source-level consumer can acquire expired database custody and read
+the same worker without launch inputs. A live lease cannot be displaced. This
+transfer records custody, not an adoption result. Immutable host finalization
+inputs, log reconstruction and heartbeat restart routing remain required. The selective restart drain still applies to these
 runs. Source approval and separate disposable installed restart proof are also
 required before a corrective activation handoff.
 
