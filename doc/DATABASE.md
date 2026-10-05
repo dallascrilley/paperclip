@@ -464,8 +464,15 @@ text. Repeated reservation must match the original snapshot. Historical custody
 keeps null preparation and cannot acquire it retroactively. Custody transfer
 retains the snapshot without modification.
 
-Live completion uses a common terminal projection function with explicit host
-inputs. Replacement consumption is not yet connected to this function.
-Heartbeat restart routing and replacement terminal finalization remain incomplete.
-These source checkpoints do not establish active-run adoption or installed
-hot-restart acceptance.
+Live and replacement consumers use the same terminal projection function with
+explicit host inputs. Startup classifies a durable legacy run as adopted only
+after its replacement consumer completes the initial fenced read. The replacement
+reconstructs complete child logs from retained frames and commits session, usage
+and terminal state under its controller lease. Generic orphan recovery retains
+existing transport custody instead of terminating or retrying from numeric PIDs.
+Missing or invalid preparation cannot fall back to PID-only adoption.
+
+Source sleeping/logging fixtures cover this route with explicit lease expiry and
+mocked restart-marker I/O in one process. Ancillary workspace/auth cleanup and
+cancellation boundaries remain incomplete. These checkpoints do not establish
+installed hot-restart acceptance or authorize live activation.

@@ -1,5 +1,10 @@
+import { claimExpiredLegacyAdapterCustody } from "./legacy-adapter-custody.js";
+import { prepareLegacyAdapterFinalizationInputs, type LegacyAdapterFinalizationInputs } from "./legacy-adapter-finalization-inputs.js";
+import { reconstructLegacyAdapterLogs } from "./legacy-adapter-log-reconstruction.js";
+import { readLegacyAdapterEventBatch } from "./legacy-adapter-events.js";
+import { readDurableChildIdentity } from "@paperclipai/adapter-utils/durable-child-process";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import { executeSupervisedLegacyAdapter, LegacyAdapterControllerDetachedError } from "./legacy-adapter-execution.js";
+import { executeSupervisedLegacyAdapter, consumeSupervisedLegacyAdapter, LegacyAdapterControllerDetachedError } from "./legacy-adapter-execution.js";
 import { publicChatTaskUrl } from "./chat-task-url.js";
 import { toolActionDeliveryService } from "./tool-action-delivery.js";
 import { githubBotConnectionIdsForRun } from "./chat-github-tools.js";
@@ -137,6 +142,7 @@ import {
   issueDocuments,
   executionWorkspaces,
   heartbeatRunEvents,
+  legacyAdapterTransports,
   heartbeatRuns,
   issueApprovals,
   issueAttachments,
@@ -6772,7 +6778,7 @@ function readConfiguredModelFromAdapterConfig(
 function attachPaperclipSessionMetadataToSessionParams(
   sessionParams: Record<string, unknown> | null | undefined,
   configuredModel: string | null,
-  configMetadata?: Omit<EffectiveRunSessionConfigMetadata, "fingerprints"> | null,
+  configMetadata?: LegacyAdapterFinalizationInputs["sessionConfigMetadata"] | null,
 ) {
   if (!configuredModel && !configMetadata) return sessionParams ?? null;
   const next = { ...(sessionParams ?? {}) };
@@ -14440,14 +14446,20 @@ export function heartbeatService(
       previousServerVersion: intent.previousServerVersion ?? serverVersion,
     };
 
+    const supervisedRunIds = new Set<string>();
+    for (const { run, adapterType } of activeRuns) {
+      if (run.controllerBootId === legacyControllerBootId && await hasRecoverableLegacyTransport(run, adapterType)) {
+        supervisedRunIds.add(run.id);
+      }
+    }
     const serverStdioRuns = activeRuns.filter(isServerStdioBoundHotRestartRun);
-    // Detached process groups do not detach their stdout/stderr pipes or the
-    // adapter's terminal-result parser from this controller. Until those have
-    // durable ownership, every recognized legacy CLI run requires a drain.
+    // Only validated independent workers own their output and terminal parser
+    // outside this controller. All other recognized legacy CLIs require drain.
     const legacyPipeRuns = activeRuns.filter(
       ({ run, adapterType }) =>
         run.runtimeMode !== "native" &&
         isTrackedLocalChildProcessAdapter(adapterType) &&
+        !supervisedRunIds.has(run.id) &&
         !serverStdioRuns.some((input) => input.run.id === run.id),
     );
     const drainRunIds = [
@@ -14498,6 +14510,15 @@ export function heartbeatService(
     });
 
     for (const { run } of activeRuns) {
+      if (supervisedRunIds.has(run.id)) {
+        // Voluntary handoff by the actual controller, after snapshot publication.
+        // An expired lease cannot renew. This abort is not operator cancellation.
+        await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: sql`clock_timestamp()` }).where(and(
+          eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running"),
+          eq(heartbeatRuns.controllerBootId, legacyControllerBootId),
+        ));
+        adapterExecutionControls.get(run.id)?.controller.abort(new Error("Legacy controller detached for hot restart"));
+      }
       await appendRunEvent(run, {
         eventType: "lifecycle",
         stream: "system",
@@ -14713,6 +14734,23 @@ export function heartbeatService(
           "adapter_not_local_child_process",
           patch,
         );
+        continue;
+      }
+
+      const [custody] = await db.select().from(legacyAdapterTransports).where(eq(legacyAdapterTransports.runId, run.id));
+      if (custody) {
+        try {
+          if (await resumeSupervisedLegacyRun(run.id)) {
+            classify(candidate, "adopted", "durable_legacy_consumer_attached", patch);
+          } else {
+            const latest = await getRun(run.id);
+            if (latest && latest.status !== "running") classify(candidate, "finalized_while_down", `run_status_${latest.status}`, patch);
+            else classify(candidate, "lost", "durable_legacy_consumer_not_attached", patch);
+          }
+        } catch (error) {
+          logger.warn({ err: error, runId: run.id }, "hot restart could not attach durable legacy consumer");
+          classify(candidate, "lost", "durable_legacy_consumer_error", patch);
+        }
         continue;
       }
 
@@ -19092,6 +19130,14 @@ export function heartbeatService(
       if (resumedRunIds.has(run.id)) continue;
       if (locallyTracked) continue;
       if (await hasLiveLegacyController(db, run)) continue;
+      const [legacyCustody] = await db.select().from(legacyAdapterTransports).where(eq(legacyAdapterTransports.runId, run.id));
+      if (legacyCustody) {
+        try { await resumeSupervisedLegacyRun(run.id); }
+        catch (error) { logger.warn({ err: error, runId: run.id }, "durable legacy custody recovery held"); }
+        // Custody excludes PID-only termination and retry-after-loss, including
+        // invalid or historical spools. It is never a new dispatch capability.
+        continue;
+      }
 
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
@@ -19956,6 +20002,163 @@ export function heartbeatService(
     return promise;
   }
 
+  async function hasRecoverableLegacyTransport(run: NonNullable<Awaited<ReturnType<typeof getRun>>>, adapterType: string) {
+    if (run.runtimeMode !== "legacy" || adapterType !== "codex_local") return false;
+    const [custody] = await db.select().from(legacyAdapterTransports).where(eq(legacyAdapterTransports.runId, run.id));
+    if (!custody || custody.companyId !== run.companyId || custody.agentId !== run.agentId ||
+        custody.adapterType !== adapterType || !custody.preparedFinalizationJson) return false;
+    try {
+      prepareLegacyAdapterFinalizationInputs(custody.preparedFinalizationJson as LegacyAdapterFinalizationInputs);
+      const binding = { runId: run.id, companyId: run.companyId, agentId: run.agentId, adapterType };
+      const directory = path.join(options.legacyAdapterWorkerInstanceRoot ?? resolvePaperclipInstanceRoot(),
+        "data", "legacy-adapter-workers", run.companyId, custody.custodyId, run.id);
+      const identity = await readDurableChildIdentity(directory);
+      if (!identity) return false;
+      const batch = await readLegacyAdapterEventBatch({ directory, binding, cursor: custody.eventCursor });
+      if (batch.terminal || (isProcessAlive(identity.supervisorPid) && isProcessAlive(identity.executorPid))) return true;
+      // Publication can race the first read, but it precedes supervisor exit.
+      return !!(await readLegacyAdapterEventBatch({ directory, binding, cursor: custody.eventCursor })).terminal;
+    } catch (error) {
+      logger.warn({ err: error, runId: run.id }, "legacy durable transport validation failed");
+      return false;
+    }
+  }
+
+  /** Replacement consumer entry point. It never provisions or launches.
+   * Unsupported or unverifiable workers retain the selective transport drain.
+   */
+  async function resumeSupervisedLegacyRun(runId: string) {
+    const run = await getRun(runId);
+    if (!run || run.status !== "running" || run.runtimeMode !== "legacy" ||
+        !run.controllerBootId || run.controllerBootId === legacyControllerBootId || activeRunExecutions.has(runId)) return false;
+    const agent = await getAgent(run.agentId);
+    const [custody] = await db.select().from(legacyAdapterTransports).where(eq(legacyAdapterTransports.runId, runId));
+    if (!agent || !custody || custody.companyId !== run.companyId || custody.agentId !== run.agentId ||
+        custody.adapterType !== agent.adapterType || custody.adapterType !== "codex_local" || !custody.preparedFinalizationJson) return false;
+    const preparation = prepareLegacyAdapterFinalizationInputs(custody.preparedFinalizationJson as LegacyAdapterFinalizationInputs);
+    const binding = { runId, companyId: run.companyId, agentId: run.agentId, adapterType: custody.adapterType };
+    const instanceRoot = options.legacyAdapterWorkerInstanceRoot ?? resolvePaperclipInstanceRoot();
+    const directory = path.join(instanceRoot, "data", "legacy-adapter-workers", run.companyId, custody.custodyId, runId);
+    // Validate bound frames/receipt before taking database authority. Numeric
+    // identifiers alone are insufficient for transport or result ownership.
+    const identity = await readDurableChildIdentity(directory);
+    if (!identity) return false;
+    const batch = await readLegacyAdapterEventBatch({ directory, binding, cursor: custody.eventCursor });
+    if (!batch.terminal && (!isProcessAlive(identity.supervisorPid) || !isProcessAlive(identity.executorPid))) return false;
+    const claimed = await claimExpiredLegacyAdapterCustody(db, { ...binding, custodyId: custody.custodyId,
+      previousBootId: run.controllerBootId });
+    if (!claimed) return false;
+    const control = createAdapterExecutionControl();
+    const lease = watchLegacyControllerLease(db, claimed.run, control.controller);
+    activeRunExecutions.add(runId);
+    let readyResolve!: () => void;
+    let readyReject!: (error: unknown) => void;
+    const ready = new Promise<void>((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
+    const execution = (async () => {
+      try {
+        await registerAdapterExecutionControl(runId, control);
+        const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
+        let outputSeq = claimed.run.lastOutputSeq;
+        const onLog: AdapterExecutionContext["onLog"] = async (stream, chunk) => {
+          await lease.assertOwned();
+          const sanitized = compactRunLogChunk(redactCurrentUserText(chunk, currentUserRedactionOptions));
+          const now = new Date();
+          outputSeq++;
+          const [updated] = await db.update(heartbeatRuns).set({ lastOutputAt: now,
+            lastOutputSeq: outputSeq, lastOutputStream: stream, updatedAt: now }).where(and(
+            eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running"),
+            eq(heartbeatRuns.controllerBootId, legacyControllerBootId),
+            sql`${heartbeatRuns.controllerLeaseExpiresAt} > clock_timestamp()`,
+          )).returning({ id: heartbeatRuns.id });
+          if (!updated) throw new LegacyAdapterControllerDetachedError();
+          publishLiveEvent({ companyId: run.companyId, type: "heartbeat.run.log", payload: {
+            runId, agentId: run.agentId, issueId: preparation.issueId, ts: now.toISOString(), seq: outputSeq,
+            stream, chunk: sanitized.slice(-MAX_LIVE_LOG_CHUNK_BYTES), truncated: sanitized.length > MAX_LIVE_LOG_CHUNK_BYTES,
+          } });
+        };
+        const adapterResult = await consumeSupervisedLegacyAdapter({ db, instanceRoot, binding,
+          custodyId: custody.custodyId, cursor: claimed.custody.eventCursor, signal: control.controller.signal,
+          onReady: readyResolve,
+          cancellationRequested: async () => {
+            const latest = await getRun(runId);
+            return latest?.status === "cancelled" || parseObject(latest?.resultJson?.executionCancellation).state === "requested";
+          },
+          project: event => ({ eventType: "legacy_adapter_worker", stream: "system",
+            payload: boundHeartbeatRunEventPayloadForStorage(redactCurrentUserValue(
+              redactEventPayload(event) ?? {}, currentUserRedactionOptions)) }),
+          onCommittedEvents: async events => {
+            for (const event of events) {
+              if (event.kind === "log") await onLog(event.stream, event.chunk);
+              if (event.kind === "progress") await recordCurrentHeartbeatRunRuntimeProgress(
+                claimed.run, event.progress as unknown as Parameters<NonNullable<AdapterExecutionContext["onRuntimeProgress"]>>[0], preparation.issueId);
+            }
+          },
+        });
+        const issueContext = preparation.issueId ? await getIssueExecutionContext(run.companyId, preparation.issueId) : null;
+        await finalizeAdapterRun({ run: claimed.run, agent, adapterResult,
+          sessionCodec: getAdapterSessionCodec(agent.adapterType), previousSessionParams: preparation.previousSessionParams,
+          runtimeForAdapter: { sessionId: preparation.previousSessionId, sessionDisplayId: preparation.previousSessionDisplayId },
+          currentUserRedactionOptions, supervisedLegacyExecution: true, sessionCompaction: preparation.sessionRotation,
+          configFreshnessResultMetadata: preparation.configFreshness, taskKey: preparation.taskKey,
+          configuredModel: preparation.configuredModel, sessionConfigMetadata: preparation.sessionConfigMetadata,
+          issueId: preparation.issueId, issueRef: issueContext, issueContext, onLog,
+          signal: control.controller.signal, taskSessionReused: preparation.taskSessionReused,
+          onControllerDetached: () => { throw new LegacyAdapterControllerDetachedError(); },
+          finishOutput: async () => {
+            await lease.assertOwned();
+            const [tail] = await db.select().from(legacyAdapterTransports).where(eq(legacyAdapterTransports.runId, runId));
+            if (!tail || tail.custodyId !== custody.custodyId) throw new LegacyAdapterControllerDetachedError();
+            // A separate file preserves the original controller's host log.
+            const handle = await runLogStore.begin({ companyId: run.companyId, agentId: run.agentId,
+              runId: `${runId}-custody-${legacyControllerBootId}` });
+            let stdoutExcerpt = "", stderrExcerpt = "", seq = 0;
+            await reconstructLegacyAdapterLogs({ directory, binding, committedCursor: tail.eventCursor,
+              assertOwned: () => lease.assertOwned(), append: async (stream, chunk) => {
+                const sanitized = compactRunLogChunk(redactCurrentUserText(chunk, currentUserRedactionOptions));
+                if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitized);
+                else stderrExcerpt = appendExcerpt(stderrExcerpt, sanitized);
+                await runLogStore.append(handle, { stream, chunk: sanitized, ts: new Date().toISOString(), seq: ++seq });
+              } });
+            const logSummary = await runLogStore.finalize(handle);
+            const [updated] = await db.update(heartbeatRuns).set({ logStore: handle.store, logRef: handle.logRef,
+              lastOutputBytes: logSummary.bytes }).where(and(eq(heartbeatRuns.id, runId),
+              eq(heartbeatRuns.controllerBootId, legacyControllerBootId), eq(heartbeatRuns.status, "running"),
+              sql`${heartbeatRuns.controllerLeaseExpiresAt} > clock_timestamp()`)).returning({ id: heartbeatRuns.id });
+            if (!updated) throw new LegacyAdapterControllerDetachedError();
+            return { logSummary, stdoutExcerpt, stderrExcerpt };
+          },
+        });
+      } catch (error) {
+        // A consumer failure cannot prove executor exit or authorize a retry.
+        readyReject(error);
+        logger.warn({ err: error, runId }, "replacement legacy consumer detached; custody retained");
+      } finally {
+        lease.stop();
+        activeRunExecutions.delete(runId);
+        control.finish();
+        if (adapterExecutionControls.get(runId) === control) adapterExecutionControls.delete(runId);
+        const latest = await getRun(runId).catch(() => null);
+        if (latest && latest.controllerBootId === legacyControllerBootId && isHeartbeatRunTerminalStatus(latest.status)) {
+          await revokeHeartbeatRunGatewayTokens({ db, companyId: run.companyId, runId }).catch(error =>
+            logger.warn({ err: error, runId }, "recovered legacy gateway-token cleanup failed"));
+          await db.update(heartbeatRuns).set({ executionControlDeadlineAt: null }).where(and(
+            eq(heartbeatRuns.id, runId), eq(heartbeatRuns.controllerBootId, legacyControllerBootId),
+            eq(heartbeatRuns.status, latest.status),
+          )).catch(error => logger.warn({ err: error, runId }, "recovered legacy deadline cleanup failed"));
+          await releaseEnvironmentLeasesForRun({ runId, companyId: run.companyId, agentId: run.agentId,
+            status: latest.status, failureReason: latest.error ?? undefined }).catch(error =>
+              logger.warn({ err: error, runId }, "recovered legacy environment cleanup failed"));
+          await releaseRuntimeServicesForRun(runId).catch(error =>
+            logger.warn({ err: error, runId }, "recovered legacy runtime cleanup failed"));
+        }
+      }
+    })();
+    activeRunExecutionPromises.add(execution);
+    void execution.finally(() => activeRunExecutionPromises.delete(execution));
+    await ready;
+    return true;
+  }
+
   // One terminal projection path for live adapters and custody consumers.
   // All invocation-time session/usage facts are explicit inputs.
   async function finalizeAdapterRun(input: {
@@ -19971,7 +20174,7 @@ export function heartbeatService(
     configFreshnessResultMetadata: Record<string, unknown>;
     taskKey: string | null;
     configuredModel: string | null;
-    sessionConfigMetadata: Omit<EffectiveRunSessionConfigMetadata, "fingerprints">;
+    sessionConfigMetadata: LegacyAdapterFinalizationInputs["sessionConfigMetadata"];
     issueId: string | null;
     issueRef: Pick<NonNullable<Awaited<ReturnType<typeof getIssueExecutionContext>>>, "id" | "identifier" | "title" | "workMode"> | null;
     issueContext: Awaited<ReturnType<typeof getIssueExecutionContext>> | null;
@@ -25246,7 +25449,7 @@ export function heartbeatService(
           throw adapterErr;
         } finally {
           try {
-            await revokeHeartbeatRunGatewayTokens({
+            if (!legacyControllerDetached) await revokeHeartbeatRunGatewayTokens({
               db,
               companyId: agent.companyId,
               runId: run.id,
@@ -25960,7 +26163,7 @@ export function heartbeatService(
         }
       }
     } finally {
-      if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
+      if (managedAiRuntime && !legacyControllerDetached) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
       let latestRun = await getRun(run.id).catch(() => null);
       try {
         if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
@@ -29578,6 +29781,7 @@ export function heartbeatService(
     prepareHotRestartShutdown,
     reconcileHotRestartAdoption,
     recoverNativeRunsAfterRestart,
+    resumeSupervisedLegacyRun,
     reapOrphanedRuns,
     sweepOrphanedActiveLeases,
     sweepPendingCleanupLeases,

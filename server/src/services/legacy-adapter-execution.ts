@@ -78,6 +78,7 @@ export async function consumeSupervisedLegacyAdapter(input: {
   project: (event: LegacyAdapterWorkerEvent) => Pick<AppendHeartbeatRunEventInput,
     "eventType" | "stream" | "level" | "color" | "message" | "payload">;
   onCommittedEvents?: (events: LegacyAdapterWorkerEvent[]) => Promise<void>;
+  onReady?: () => void;
 }) {
   const binding = input.binding;
   try {
@@ -87,6 +88,7 @@ export async function consumeSupervisedLegacyAdapter(input: {
       events: [], project: input.project,
     }, input.controllerBootId);
     if (!owned && !await input.cancellationRequested()) throw new LegacyAdapterControllerDetachedError();
+    if (owned) input.onReady?.();
     const directory = path.join(input.instanceRoot, "data", "legacy-adapter-workers",
       binding.companyId, input.custodyId, binding.runId);
     let cursor = input.cursor;

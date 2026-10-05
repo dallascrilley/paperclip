@@ -250,10 +250,11 @@ recycled process when identity cannot be established.
 
 Without `--drain-required`, the server verifies the target PID, stops scheduler
 work, waits for queue claims, and captures active run identities. Recognized
-legacy local adapters still own controller-bound stdout/stderr pipes and
-terminal-result parsers, even when their process groups are detached. The server
+legacy local adapters without independent custody still own controller-bound
+stdout/stderr pipes and terminal-result parsers, even when their process groups
+are detached. The server
 requires a selective drain for these CLI runs (`active_legacy_pipe_run`) and for
-server-stdio ACP runs (`active_acp_run`). A mixed ACP/CLI restart drains both sets.
+server-stdio ACP runs (`active_acp_run`). A mixed ACP/unsupervised CLI restart drains both sets.
 Native Runner recovery retains its separate ownership path.
 
 The experimental server flag `PAPERCLIP_ENABLE_LEGACY_SUPERVISION=1` selects an
@@ -265,13 +266,24 @@ the common session, usage and run finalizer. A recorded cancellation requests
 worker cleanup; lost controller authority preserves the worker and custody.
 The flag is off by default and does not select remote or ACP execution.
 
-This flag is an implementation checkpoint, not an active-restart activation
-route. A source-level consumer can acquire expired database custody and read
-the same worker without launch inputs. A live lease cannot be displaced. This
-transfer records custody, not an adoption result. Immutable host finalization
-inputs, log reconstruction and heartbeat restart routing remain required. The selective restart drain still applies to these
-runs. Source approval and separate disposable installed restart proof are also
-required before a corrective activation handoff.
+This flag remains an experimental implementation checkpoint. Shutdown validates
+independent transport custody and its immutable host preparation before excluding
+that run from the legacy pipe drain. After snapshot publication, the outgoing
+controller expires its own lease and detaches its reader. It preserves the worker
+and its runtime tokens. Startup reports adoption only after the replacement opens
+a fenced consumer. That consumer uses saved session/usage inputs, reconstructs
+child logs from retained frames and commits the terminal result through the common
+host finalizer. A live lease cannot be displaced. Generic orphan recovery retains
+durable custody instead of PID-only termination or retry-after-loss.
+
+The supported worker currently covers local `codex_local` with engine `cli`.
+Remote execution, ACP engines and other legacy adapters retain their drain gate.
+Pre-change PID-only runs cannot acquire independent pipes or prepared custody
+retroactively. They must complete before a quiescent rollout. That rollout is
+not active-adoption proof. Recovery of ancillary workspace finalization, managed
+auth-home cleanup and cancellation boundaries remains under development. Native
+source approval, full project gates and separate disposable installed restart
+proof remain required before a corrective activation handoff.
 
 A selective drain interrupts the original runs and creates bounded conversation
 retries. It does not preserve the executor, adopt active legacy CLI output, or
