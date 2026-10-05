@@ -470,16 +470,21 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .resolves.toEqual([{ checkoutRunId: runningRunId, executionRunId: runningRunId }]);
   });
 
-  it("terminalizes a running run whose issue is terminal, even while the process stays alive (reuse-lease path)", async () => {
+  it.each([false, true])("terminalizes a run for a terminal issue (dead adopted process: %s)", async (adopted) => {
     // Reuse Lease ON stops the sandbox but keeps the server process alive, so
     // the in-memory handle and the recorded pid can both persist. The
     // process-death authority misses this case. The issue-terminal authority
     // catches it: the issue reached "done" while the run row stayed "running".
     const { companyId, agentId, runningRunId } = await seed();
-    // process.pid is the live test process, so isPidAlive returns true.
+    // Cover both a live reuse-lease process and a dead adopted process.
     await db
       .update(heartbeatRuns)
-      .set({ processPid: process.pid })
+      .set({
+        processPid: adopted ? 2_000_000_000 : process.pid,
+        resultJson: adopted
+          ? { hotRestart: { adopted: true, adoptedAt: new Date().toISOString() } }
+          : null,
+      })
       .where(eq(heartbeatRuns.id, runningRunId));
     const issueId = randomUUID();
     await db.insert(issues).values({

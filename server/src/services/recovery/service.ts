@@ -5621,6 +5621,20 @@ export function recoveryService(
       }
     }
 
+    // Adopted processes belong to the process-loss reaper, including its
+    // staleness window and guarded retry write. Terminalizing one here would
+    // hide it from that reaper and strand the active issue without a retry.
+    // Issue-terminal authority still ends runs whose work is already closed.
+    const hotRestart = parseObject(parseObject(run.resultJson).hotRestart);
+    if (
+      !issueTerminalStatus &&
+      processGone &&
+      hotRestart.adopted === true &&
+      typeof hotRestart.adoptedAt === "string"
+    ) {
+      return { terminalized: false, status: run.status };
+    }
+
     // Neither authority applies. The run is still live, so leave it alone.
     if (!issueTerminalStatus && !processGone) {
       return { terminalized: false, status: run.status };

@@ -3495,6 +3495,72 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("defers an adopted process death to the reaper and schedules exactly one continuation", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId, agentId, issueId } = await seedRunFixture({
+      agentStatus: "idle",
+      processPid: child.pid ?? null,
+      contextSnapshot: { executionEngine: "cli", processTopology: "detached" },
+    });
+
+    await withTempPaperclipHome(async (home) => {
+      const heartbeat = heartbeatService(db);
+      const adoptedAt = new Date();
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: adoptedAt,
+      });
+      await heartbeat.prepareHotRestartShutdown("SIGTERM", adoptedAt);
+      expect(await heartbeat.reconcileHotRestartAdoption(adoptedAt)).toMatchObject({
+        adoptedRunIds: [runId], lostRunIds: [],
+      });
+      const reportPath = resolveHotRestartReportPath(home);
+      const reportBefore = await fs.readFile(reportPath, "utf8");
+      await new Promise<void>((resolve) => {
+        child.once("exit", () => resolve());
+        child.kill("SIGKILL");
+      });
+
+      const firstSweep = await heartbeat.sweepStaleIssueLocks();
+      expect(firstSweep.terminalizedRunIds).toEqual([]);
+      expect(firstSweep.cleared).toBe(0);
+      expect(await heartbeat.reapOrphanedRuns({ staleThresholdMs: 300_000 })).toEqual({
+        reaped: 0, runIds: [],
+      });
+      const [preservedIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(preservedIssue).toMatchObject({
+        status: "in_progress", assigneeAgentId: agentId,
+        checkoutRunId: runId, executionRunId: runId,
+      });
+
+      // Advance the persisted freshness clock past the periodic reaper window.
+      await db.update(heartbeatRuns).set({
+        updatedAt: new Date(adoptedAt.getTime() - 300_001),
+      }).where(eq(heartbeatRuns.id, runId));
+      expect((await heartbeat.sweepStaleIssueLocks()).terminalizedRunIds).toEqual([]);
+      expect(await heartbeat.reapOrphanedRuns({ staleThresholdMs: 300_000 })).toEqual({
+        reaped: 1, runIds: [runId],
+      });
+      await heartbeat.sweepStaleIssueLocks();
+      await heartbeat.reapOrphanedRuns({ staleThresholdMs: 300_000 });
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs.find(run => run.id === runId)).toMatchObject({
+        status: "failed", errorCode: "process_lost",
+        resultJson: { hotRestart: { adopted: true, adoptedAt: adoptedAt.toISOString() } },
+      });
+      const continuations = runs.filter(run => run.retryOfRunId === runId);
+      expect(continuations).toHaveLength(1);
+      expect(continuations[0]).toMatchObject({
+        agentId, status: "scheduled_retry", contextSnapshot: { issueId },
+      });
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(issue).toMatchObject({ status: "in_progress", assigneeAgentId: agentId });
+      expect(await fs.readFile(reportPath, "utf8")).toBe(reportBefore);
+    });
+  });
+
   it.skipIf(process.platform === "win32")(
     "keeps process-group-only hot-restart adoptions out of process_lost reaping",
     async () => {
