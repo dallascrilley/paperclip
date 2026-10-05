@@ -23,7 +23,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { taskWatchdogService } from "../services/task-watchdogs.ts";
+import { snapshotDeltaConfinedToMutation, taskWatchdogService } from "../services/task-watchdogs.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -808,6 +808,64 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
         });
         expect(result).toMatchObject({ advanced: false, reason: "external_change" });
         expect(await t.recordedFingerprint()).toBe(t.stopFingerprint);
+      });
+
+      describe("parent target with a child leaf", () => {
+        async function parentSetup() {
+          const t = await setup();
+          await seedIssue(t.companyId, { identifier: "WDOG-PARENT-CHILD", status: "blocked", parentId: t.sourceId });
+          return t;
+        }
+
+        it("refuses an external pending interaction on the parent during the run's own comment", async () => {
+          const t = await parentSetup();
+          const baseline = await revalidatedBaseline(t);
+          await seedPendingInteraction(t.companyId, t.sourceId, t.agentId);
+          const result = await t.service.advanceMutationScopeFingerprint(t.scope(t.stopFingerprint), t.runId, {
+            baseline,
+            targetIssueId: t.sourceId,
+            expectedLeafChange: {},
+          });
+          expect(result).toMatchObject({ advanced: false, reason: "external_change" });
+          expect(await t.recordedFingerprint()).toBe(t.stopFingerprint);
+          expect((await t.service.revalidateMutationScope(t.scope(t.stopFingerprint))).allowed).toBe(false);
+        });
+
+        it("refuses an external pending approval on the parent during the run's own PATCH", async () => {
+          const t = await parentSetup();
+          const baseline = await revalidatedBaseline(t);
+          const approvalId = randomUUID();
+          await db.insert(approvals).values({
+            id: approvalId,
+            companyId: t.companyId,
+            type: "request_board_approval",
+            requestedByAgentId: t.agentId,
+            status: "pending",
+            payload: { summary: "External approval." },
+          });
+          await db.insert(issueApprovals).values({
+            companyId: t.companyId,
+            issueId: t.sourceId,
+            approvalId,
+            linkedByAgentId: t.agentId,
+          });
+          const result = await t.service.advanceMutationScopeFingerprint(t.scope(t.stopFingerprint), t.runId, {
+            baseline,
+            targetIssueId: t.sourceId,
+            expectedLeafChange: {},
+          });
+          expect(result).toMatchObject({ advanced: false, reason: "external_change" });
+          expect(await t.recordedFingerprint()).toBe(t.stopFingerprint);
+        });
+
+        it("treats an unchanged parent as confined to the mutation", async () => {
+          const t = await parentSetup();
+          const baseline = await revalidatedBaseline(t);
+          expect(snapshotDeltaConfinedToMutation(baseline, baseline, {
+            targetIssueId: t.sourceId,
+            expectedLeafChange: {},
+          })).toBe(true);
+        });
       });
 
       it("refuses a status the request did not ask for", async () => {

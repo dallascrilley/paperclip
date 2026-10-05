@@ -405,10 +405,12 @@ export function snapshotDeltaConfinedToMutation(
   const a = beforeLeaves.get(target.targetIssueId);
   const b = afterLeaves.get(target.targetIssueId);
   if (removable === null) {
-    if (!a || !b) return !a && !b;
+    // Waits (interactions, approvals) are compared even when the target has no material
+    // leaf, as a parent with children does: they still feed the stop fingerprint.
     if (canonicalJson(before.waitsByIssueId[target.targetIssueId] ?? null) !== canonicalJson(after.waitsByIssueId[target.targetIssueId] ?? null)) {
       return false;
     }
+    if (!a || !b) return !a && !b;
     const expected = target.expectedLeafChange ?? {};
     for (const key of ["status", "assigneeAgentId", "assigneeUserId", "blockerIssueIds", "pendingInteractionIds", "pendingApprovalIds"] as const) {
       const sortIfList = (value: unknown) => (Array.isArray(value) ? [...value].sort() : value);
