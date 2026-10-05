@@ -2,6 +2,7 @@ import type { LegacyAdapterFinalizationInputs } from "../services/legacy-adapter
 export function preparedFinalizationFixture(): LegacyAdapterFinalizationInputs {
   return {
     version: 1, taskKey: "fixture-task", issueId: null, configuredModel: "fixture-model",
+    managedAiCleanup: null,
     workspace: { executionWorkspaceId: null, cwd: "/fixture", worktreePath: null, branchName: null },
     previousSessionParams: { sessionId: "fixture-session", cwd: "/fixture" },
     previousSessionId: "fixture-session", previousSessionDisplayId: "fixture-session", taskSessionReused: true,

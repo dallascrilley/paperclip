@@ -18,7 +18,7 @@ import { hasRemoteTerminationReceipt, remoteExecutionHasStopped, remoteTerminati
 import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments } from "./connector-runtime.js";
 import { admitExplicitNativeContinuation, undeliveredLegacyUserCommentIds } from "./explicit-native-continuation.js";
 import { connectionIntentService } from "./connection-intents.js";
-import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
+import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, cleanupManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
 import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
@@ -20271,6 +20271,9 @@ export function heartbeatService(
     if (!agent || !custody || custody.companyId !== run.companyId || custody.agentId !== run.agentId ||
         custody.adapterType !== agent.adapterType || custody.adapterType !== "codex_local" || !custody.preparedFinalizationJson) return false;
     const preparation = prepareLegacyAdapterFinalizationInputs(custody.preparedFinalizationJson as LegacyAdapterFinalizationInputs);
+    if (preparation.managedAiCleanup && preparation.managedAiCleanup.companyId !== run.companyId) {
+      throw new Error("Managed AI cleanup company binding mismatch");
+    }
     const binding = { runId, companyId: run.companyId, agentId: run.agentId, adapterType: custody.adapterType };
     const instanceRoot = options.legacyAdapterWorkerInstanceRoot ?? resolvePaperclipInstanceRoot();
     const directory = path.join(instanceRoot, "data", "legacy-adapter-workers", run.companyId, custody.custodyId, runId);
@@ -20414,6 +20417,10 @@ export function heartbeatService(
         if (adapterExecutionControls.get(runId) === control) adapterExecutionControls.delete(runId);
         const latest = await getRun(runId).catch(() => null);
         if (workerTerminalConsumed && latest && latest.controllerBootId === legacyControllerBootId && isHeartbeatRunTerminalStatus(latest.status)) {
+          if (preparation.managedAiCleanup) await cleanupManagedAiRuntime(db, {
+            root: path.join(instanceRoot, "data", "managed-ai-homes", run.companyId),
+            descriptor: preparation.managedAiCleanup,
+          }).catch(error => logger.warn({ err: error, runId }, "recovered managed AI refresh or cleanup failed"));
           await revokeHeartbeatRunGatewayTokens({ db, companyId: run.companyId, runId }).catch(error =>
             logger.warn({ err: error, runId }, "recovered legacy gateway-token cleanup failed"));
           await db.update(heartbeatRuns).set({ executionControlDeadlineAt: null }).where(and(
@@ -20475,7 +20482,8 @@ export function heartbeatService(
     const latestRun = await getRun(run.id);
     if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
       outcome = latestRun.status;
-    } else if (input.signal.aborted) {
+    } else if (input.signal.aborted || (supervisedLegacyExecution &&
+      parseObject(latestRun?.resultJson?.executionCancellation).state === "requested")) {
       outcome = "cancelled";
     } else if (adapterResult.nativeFinalization) {
       const nativeTerminal =
@@ -22327,7 +22335,10 @@ export function heartbeatService(
         });
       if (aiBinding) {
         try {
-          managedAiRuntime = await prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig });
+          managedAiRuntime = await prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig,
+            ...(runtimeEnv.PAPERCLIP_ENABLE_LEGACY_SUPERVISION === "1" && agent.adapterType === "codex_local"
+              ? { persistentHomeRoot: path.join(options.legacyAdapterWorkerInstanceRoot ?? resolvePaperclipInstanceRoot(),
+                  "data", "managed-ai-homes", agent.companyId) } : {}) });
         } catch (error) {
           // Only fresh executions can receive a pre-provider wait receipt. A
           // persisted native input may already have provider effects to recover.
@@ -25284,6 +25295,7 @@ export function heartbeatService(
                       secretValues: await createRunSecretRedactionRegistry(db).resolveValuesForRun(run.companyId, run.id),
                       preparedFinalization: {
                         version: 1, taskKey, issueId, configuredModel,
+                        managedAiCleanup: managedAiRuntime?.cleanupDescriptor ?? null,
                         workspace: { executionWorkspaceId: persistedExecutionWorkspace?.id ?? null,
                           cwd: executionWorkspace.cwd, worktreePath: executionWorkspace.worktreePath ?? null,
                           branchName: executionWorkspace.branchName ?? null },

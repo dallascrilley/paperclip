@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { managedAiCleanupDescriptorSchema } from "./managed-ai-cleanup-descriptor.js";
 
 const nullableString = z.string().nullable();
 const strings = z.array(z.string());
@@ -16,6 +17,7 @@ export const legacyAdapterFinalizationInputsSchema = z.object({
   taskKey: nullableString,
   issueId: nullableString,
   configuredModel: nullableString,
+  managedAiCleanup: managedAiCleanupDescriptorSchema.nullable(),
   workspace: z.object({ executionWorkspaceId: z.string().uuid().nullable(),
     cwd: z.string(), worktreePath: nullableString, branchName: nullableString }).strict(),
   previousSessionParams: sessionParams,

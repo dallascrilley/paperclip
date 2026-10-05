@@ -285,13 +285,19 @@ worktree path and branch fallback in immutable preparation. The replacement
 reuses the original workspace finalizer, including the managed branch inspection,
 supported coherence repair and operation receipt. It validates the saved workspace
 against the company-scoped database record. Branch validation failure remains a
-failed run; it does not certify successful finalization. Managed auth-home cleanup
-remains under development. A Stop on the attached replacement
+failed run; it does not certify successful finalization. Managed AI runs on this
+experimental path use private homes under the instance data directory. Immutable
+preparation stores their scoped IDs, basename, ownership token and credential hash.
+The replacement refreshes the original grant under its existing secret lock and
+provider freshness check, then removes only the matching owned home after the
+worker terminal receipt. Lost transport authority leaves that home intact. A Stop on the attached replacement
 consumer records the bound exit tail without reviving the cancelled row. Running
 event ingestion still requires a live lease; cancelled tail ingestion requires
 the same company, agent, custody, cursor and controller identity. Replacement
-resource cleanup requires a consumed worker terminal receipt. Recovery after a
-controller disappears during Stop remains to be verified. Native
+resource cleanup requires a consumed worker terminal receipt. A replacement
+reader also consumes a persisted Stop request while the run is still running;
+it joins the same worker and finalizes cancelled. Recovery when the controller
+disappears after the row is already cancelled remains to be verified. Native
 source approval, full project gates and separate disposable installed restart
 proof remain required before a corrective activation handoff.
 

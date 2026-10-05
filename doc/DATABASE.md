@@ -473,8 +473,9 @@ existing transport custody instead of terminating or retrying from numeric PIDs.
 Missing or invalid preparation cannot fall back to PID-only adoption.
 
 Source sleeping/logging fixtures cover this route with explicit lease expiry and
-mocked restart-marker I/O in one process. Ancillary workspace/auth cleanup and
-cancellation boundaries remain incomplete. These checkpoints do not establish
+mocked restart-marker I/O in one process. Shared workspace finalization and
+scoped managed auth cleanup now have source coverage. Recovery after a controller
+disappears with an already-cancelled row remains incomplete. These checkpoints do not establish
 installed hot-restart acceptance or authorize live activation.
 
 The experimental legacy preparation also records credential-free workspace facts
@@ -483,3 +484,10 @@ The replacement validates the saved ID against the company-scoped workspace and
 uses the same host workspace-finalize barrier as the original controller. A
 historical preparation without these required facts cannot be claimed as a
 complete recovery capability. The worker cannot supply or change these facts.
+
+Managed AI cleanup preparation holds the company, original grant and connection
+IDs, owned home basename/token, provider and original credential hash. It contains
+no credential value. The instance-owned home root is derived by the replacement
+controller. Cleanup validates the home marker before refresh or removal and uses
+the existing grant/secret locking and provider freshness merge. A consumed worker
+terminal receipt is required before replacement cleanup.

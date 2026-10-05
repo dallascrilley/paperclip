@@ -102,8 +102,9 @@ export async function consumeSupervisedLegacyAdapter(input: {
       input.onReady?.();
     }
     for (;;) {
-      if (input.signal?.aborted) {
-        if (!await input.cancellationRequested()) throw new LegacyAdapterControllerDetachedError();
+      const stopRequested = await input.cancellationRequested();
+      if (input.signal?.aborted || stopRequested) {
+        if (!stopRequested) throw new LegacyAdapterControllerDetachedError();
         if (!cancelling) { await cancelLegacyAdapterWorker(directory); cancelling = true; }
       }
       const batch = await readLegacyAdapterEventBatch({ directory, binding, cursor });

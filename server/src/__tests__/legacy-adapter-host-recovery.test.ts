@@ -69,7 +69,7 @@ describe("replacement legacy host finalization", () => {
     expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId))).toHaveLength(0);
   });
 
-  it.each(["sleeping", "logging", "cancelled", "branch_mismatch"] as const)("finalizes the same %s Codex executor through common host session and usage projection", async mode => {
+  it.each(["sleeping", "logging", "cancelled", "pending_stop", "branch_mismatch"] as const)("finalizes the same %s Codex executor through common host session and usage projection", async mode => {
     const runId = randomUUID(), previousBootId = randomUUID(), replacementBootId = legacyControllerBootId;
     const binding = { runId, companyId, agentId, adapterType: "codex_local" };
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "legacy",
@@ -93,6 +93,14 @@ describe("replacement legacy host finalization", () => {
         cwd: work, providerRef: work, branchName: "expected", status: "active" });
       preparation.workspace = { executionWorkspaceId: workspaceId, cwd: work, worktreePath: work, branchName: "expected" };
     } else await fs.mkdir(work);
+    const managedHomeRoot = path.join(root, "data", "managed-ai-homes", companyId);
+    const cleanupGrantId = randomUUID();
+    const managedHome = path.join(managedHomeRoot, `paperclip-ai-${companyId}-${cleanupGrantId}-fixture`);
+    await fs.mkdir(managedHome, { recursive: true, mode: 0o700 });
+    preparation.managedAiCleanup = { companyId, grantId: cleanupGrantId, connectionId: randomUUID(),
+      homeName: path.basename(managedHome), ownershipToken: randomUUID(), provider: "openai",
+      subscriptionFile: false, originalCredentialHash: "0".repeat(64) };
+    await fs.writeFile(path.join(managedHome, ".paperclip-managed-ai-home.json"), JSON.stringify(preparation.managedAiCleanup));
     const custody = await reserveLegacyAdapterCustody(db, binding, previousBootId, preparation);
     const home = path.join(work, "home"), codexHome = path.join(work, "codex");
     await fs.mkdir(home); await fs.mkdir(codexHome);
@@ -143,6 +151,7 @@ describe("replacement legacy host finalization", () => {
       const [before] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       expect(before.processPid).toBeGreaterThan(0);
       process.kill(before.processPid!, 0);
+      expect((await fs.stat(managedHome)).isDirectory()).toBe(true);
       expect(await fs.readFile(effects, "utf8")).toBe("started\n");
       const heartbeat = heartbeatService(db, { legacyAdapterWorkerInstanceRoot: root });
       expect(await heartbeat.resumeSupervisedLegacyRun(runId)).toBe(false);
@@ -158,14 +167,18 @@ describe("replacement legacy host finalization", () => {
           processPid: before.processPid, processGroupId: before.processGroupId,
         }] },
       });
+      if (mode === "pending_stop") await db.update(heartbeatRuns).set({
+        resultJson: { executionCancellation: { state: "requested", requestedAt: new Date().toISOString() } },
+      }).where(eq(heartbeatRuns.id, runId));
       const adoption = await heartbeat.reconcileHotRestartAdoption();
       expect(adoption).toMatchObject({ mode: "reported", adoptedRunIds: [runId], lostRunIds: [], skippedRunIds: [] });
       expect(await heartbeat.resumeSupervisedLegacyRun(runId)).toBe(false);
       if (mode === "cancelled") await heartbeat.cancelRun(runId, "Stop recovered fixture");
-      else await fs.writeFile(release, "");
+      else if (mode !== "pending_stop") await fs.writeFile(release, "");
       await heartbeat.drainActiveRunExecutions();
+      await expect(fs.access(managedHome)).rejects.toThrow();
       const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-      expect(after).toMatchObject({ status: mode === "cancelled" ? "cancelled" : mode === "branch_mismatch" ? "failed" : "succeeded", processPid: before.processPid, processGroupId: before.processGroupId,
+      expect(after).toMatchObject({ status: (mode === "cancelled" || mode === "pending_stop") ? "cancelled" : mode === "branch_mismatch" ? "failed" : "succeeded", processPid: before.processPid, processGroupId: before.processGroupId,
         controllerBootId: replacementBootId });
       const [tail] = await db.select().from(legacyAdapterTransports).where(eq(legacyAdapterTransports.runId, runId));
       expect(tail.eventCursor).toBeGreaterThan(previousCustody.eventCursor);
@@ -175,7 +188,7 @@ describe("replacement legacy host finalization", () => {
       const log = await heartbeat.readLog(runId, { limitBytes: 1024 * 1024 });
       expect(log.content).toContain("thread.started");
       expect(after.stdoutExcerpt).toContain("thread.started");
-      if (mode === "cancelled") {
+      if (mode === "cancelled" || mode === "pending_stop") {
         expect(after).toMatchObject({ status: "cancelled", sessionIdAfter: "reattached-session",
           resultJson: { executionCancellation: { state: "acknowledged", proof: "durable_adapter_worker_join",
             custodyId: custody.custodyId } } });

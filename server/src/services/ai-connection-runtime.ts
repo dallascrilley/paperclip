@@ -1,10 +1,13 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { HttpError, unprocessable } from "../errors.js";
-import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, rm, lstat, realpath, open } from "node:fs/promises";
+import { constants } from "node:fs";
+import { isDeepStrictEqual } from "node:util";
+import { managedAiCleanupDescriptorSchema, type ManagedAiCleanupDescriptor } from "./managed-ai-cleanup-descriptor.js";
 import os from "node:os";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
-import { type Db, companySecrets, connectionGrants } from "@paperclipai/db";
+import { type Db, companySecrets, connectionGrants, toolConnections } from "@paperclipai/db";
 import {
   AI_CONNECTION_CAPABILITIES,
   type AiConnectionBinding,
@@ -204,6 +207,7 @@ export async function prepareManagedAiRuntime(
     allowUninstalledShared?: boolean;
     allowLegacyValidation?: boolean;
     config: Record<string, unknown>;
+    persistentHomeRoot?: string;
   },
 ) {
   const configuredEnv =
@@ -252,9 +256,11 @@ export async function prepareManagedAiRuntime(
         "The selected default changed. Retry this execution.",
       );
     const value = await service.credential(selection);
+    const homeRoot = input.persistentHomeRoot ?? os.tmpdir();
+    await mkdir(homeRoot, { recursive: true, mode: 0o700 });
     home = await mkdtemp(
       path.join(
-        os.tmpdir(),
+        homeRoot,
         `paperclip-ai-${input.companyId}-${selection.grant.id}-`,
       ),
     );
@@ -297,6 +303,13 @@ export async function prepareManagedAiRuntime(
       .update(value)
       .digest("hex")
       .slice(0, 16);
+    const cleanupDescriptor: ManagedAiCleanupDescriptor = {
+      companyId: input.companyId, grantId: selection.grant.id, connectionId: selection.connection.id,
+      homeName: path.basename(home), ownershipToken: randomUUID(), provider: input.binding.provider,
+      subscriptionFile, originalCredentialHash: createHash("sha256").update(value).digest("hex"),
+    };
+    await writeFile(path.join(home, ".paperclip-managed-ai-home.json"), JSON.stringify(cleanupDescriptor),
+      { flag: "wx", mode: 0o600 });
     const identity = `${selection.grant.id}:${input.responsibleUserId ?? "shared"}:${generation}`;
     return {
       config: {
@@ -309,80 +322,117 @@ export async function prepareManagedAiRuntime(
       accountOwnerUserId: selection.grant.subjectUserId,
       identity,
       home,
-      cleanup: async () => {
-        try {
-          if (subscriptionFile) {
-            const refreshed = await readFile(authFile, "utf8");
-            if (refreshed !== value)
-              await db.transaction(async (tx) => {
-                const [grant] = await tx
-                  .select()
-                  .from(connectionGrants)
-                  .where(
-                    and(
-                      eq(connectionGrants.id, selection.grant.id),
-                      eq(connectionGrants.companyId, input.companyId),
-                    ),
-                  )
-                  .for("update");
-                // A missing or revoked grant blocks the write-back. Among
-                // active copies, the merge decision below keeps the
-                // credential with the newest provider freshness field.
-                if (!grant || grant.status !== "active") return;
-                const ref = grant.credentialSecretRefs.find(
-                  (r) => r.configPath === "ai.credential",
-                );
-                if (!ref) return;
-                // Lock the referenced secret row for the rest of this
-                // transaction. The grant-row lock above does not cover it,
-                // so an authorized rotation of this secret could otherwise
-                // land between the read and the write below and be
-                // overwritten by this stale write-back.
-                await tx
-                  .select({ id: companySecrets.id })
-                  .from(companySecrets)
-                  .where(
-                    and(
-                      eq(companySecrets.id, ref.secretId),
-                      eq(companySecrets.companyId, input.companyId),
-                    ),
-                  )
-                  .for("update");
-                const current = await aiConnectionService(
-                  tx as unknown as Db,
-                ).credential({ ...selection, grant });
-                const destination = path.join(
-                  providerHome,
-                  "current-auth.json",
-                );
-                await writeFile(destination, current, { mode: 0o600 });
-                const decision =
-                  input.binding.provider === "openai"
-                    ? await decideCodexAuthMerge(authFile, destination, {
-                        errorLabel: "AI account refresh",
-                      })
-                    : await decideGrokAuthMerge(authFile, destination, {
-                        errorLabel: "AI account refresh",
-                      });
-                if (decision !== 10) return;
-                await secretService(tx).rotate(
-                  ref.secretId,
-                  { value: refreshed },
-                  { userId: grant.subjectUserId },
-                );
-                await tx
-                  .update(connectionGrants)
-                  .set({ updatedAt: new Date() })
-                  .where(eq(connectionGrants.id, grant.id));
-              });
-          }
-        } finally {
-          if (home) await rm(home, { recursive: true, force: true });
-        }
-      },
+      cleanupDescriptor: input.persistentHomeRoot ? cleanupDescriptor : null,
+      cleanup: () => cleanupManagedAiRuntime(db, { root: homeRoot, descriptor: cleanupDescriptor }),
     };
   } catch (error) {
     if (home) await rm(home, { recursive: true, force: true });
     throw error;
+  }
+}
+
+/** Reuse the original refresh locks and provider freshness merge after worker
+ * settlement. The root is supplied by the host, never by an adapter receipt. */
+export async function cleanupManagedAiRuntime(db: Db, input: { root: string; descriptor: ManagedAiCleanupDescriptor }) {
+  const descriptor = managedAiCleanupDescriptorSchema.parse(input.descriptor);
+  if (!descriptor.homeName.startsWith(`paperclip-ai-${descriptor.companyId}-${descriptor.grantId}-`)) {
+    throw new Error("Managed AI home binding mismatch");
+  }
+  const home = path.join(input.root, descriptor.homeName);
+  let stat;
+  try { stat = await lstat(home); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+  if (!stat.isDirectory() || stat.isSymbolicLink() || path.dirname(await realpath(home)) !== await realpath(input.root)) {
+    throw new Error("Managed AI home escaped owned root");
+  }
+  const marker = await open(path.join(home, ".paperclip-managed-ai-home.json"), constants.O_RDONLY | constants.O_NOFOLLOW);
+  let recorded;
+  try {
+    const markerStat = await marker.stat();
+    if (!markerStat.isFile() || markerStat.size > 4096) throw new Error("Invalid managed AI home marker");
+    recorded = JSON.parse(await marker.readFile("utf8"));
+  } finally { await marker.close(); }
+  if (!isDeepStrictEqual(recorded, descriptor)) throw new Error("Managed AI home ownership mismatch");
+  const providerHome = path.join(home, "provider"), authFile = path.join(providerHome, "auth.json");
+  try {
+    if (descriptor.subscriptionFile) {
+      const providerStat = await lstat(providerHome);
+      if (!providerStat.isDirectory() || providerStat.isSymbolicLink()) throw new Error("Invalid managed AI provider home");
+      const auth = await open(authFile, constants.O_RDONLY | constants.O_NOFOLLOW);
+      let refreshed: string;
+      try {
+        const authStat = await auth.stat();
+        if (!authStat.isFile() || authStat.size > 4 * 1024 * 1024) throw new Error("Invalid managed AI auth file");
+        refreshed = await auth.readFile("utf8");
+      } finally { await auth.close(); }
+      if (createHash("sha256").update(refreshed).digest("hex") !== descriptor.originalCredentialHash)
+        await db.transaction(async (tx) => {
+          const [grant] = await tx
+            .select()
+            .from(connectionGrants)
+            .where(
+              and(
+                eq(connectionGrants.id, descriptor.grantId),
+                eq(connectionGrants.companyId, descriptor.companyId),
+              ),
+            )
+            .for("update");
+          // A missing or revoked grant blocks the write-back. Among
+          // active copies, the merge decision below keeps the
+          // credential with the newest provider freshness field.
+          if (!grant || grant.status !== "active") return;
+          const [connection] = await tx.select().from(toolConnections).where(and(
+            eq(toolConnections.id, descriptor.connectionId), eq(toolConnections.companyId, descriptor.companyId)));
+          if (!connection || grant.connectionId !== connection.id) throw new Error("Managed AI grant binding mismatch");
+          const ref = grant.credentialSecretRefs.find(
+            (r) => r.configPath === "ai.credential",
+          );
+          if (!ref) return;
+          // Lock the referenced secret row for the rest of this
+          // transaction. The grant-row lock above does not cover it,
+          // so an authorized rotation of this secret could otherwise
+          // land between the read and the write below and be
+          // overwritten by this stale write-back.
+          await tx
+            .select({ id: companySecrets.id })
+            .from(companySecrets)
+            .where(
+              and(
+                eq(companySecrets.id, ref.secretId),
+                eq(companySecrets.companyId, descriptor.companyId),
+              ),
+            )
+            .for("update");
+          const current = await aiConnectionService(
+            tx as unknown as Db,
+          ).credential({ connection, grant });
+          const destination = path.join(
+            providerHome,
+            "current-auth.json",
+          );
+          const currentFile = await open(destination, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
+          try { await currentFile.writeFile(current); } finally { await currentFile.close(); }
+          const decision =
+            descriptor.provider === "openai"
+              ? await decideCodexAuthMerge(authFile, destination, {
+                  errorLabel: "AI account refresh",
+                })
+              : await decideGrokAuthMerge(authFile, destination, {
+                  errorLabel: "AI account refresh",
+                });
+          if (decision !== 10) return;
+          await secretService(tx).rotate(
+            ref.secretId,
+            { value: refreshed },
+            { userId: grant.subjectUserId },
+          );
+          await tx
+            .update(connectionGrants)
+            .set({ updatedAt: new Date() })
+            .where(eq(connectionGrants.id, grant.id));
+        });
+    }
+  } finally {
+    await rm(home, { recursive: true, force: true });
   }
 }

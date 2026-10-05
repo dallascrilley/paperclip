@@ -12,7 +12,7 @@ import { createDb, companies, agents, heartbeatRuns, companyMemberships, connect
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import { aiConnectionService } from "../services/ai-connections.js";
 import * as executionTarget from "@paperclipai/adapter-utils/execution-target";
-import { prepareManagedAiRuntime, assertManagedAiProjectAuth } from "../services/ai-connection-runtime.js";
+import { prepareManagedAiRuntime, cleanupManagedAiRuntime, assertManagedAiProjectAuth } from "../services/ai-connection-runtime.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { secretService } from "../services/secrets.js";
 import { aiConnectionBindingSchema, connectionPurposeTransportSchema, isAiConnectionCompatible } from "@paperclipai/shared";
@@ -319,6 +319,35 @@ describe("managed AI connections", () => {
       await Promise.all([parent.cleanup(), child.cleanup()]);
     }
   });
+  it("recovers scoped managed auth cleanup from credential-free preparation without selecting another grant", async () => {
+    const auth = (hour: number) => JSON.stringify({ tokens: { account_id: "cleanup-fixture-account",
+      id_token: "fixture-id", access_token: "fixture-access", refresh_token: "fixture-refresh" },
+      last_refresh: `2026-09-10T${hour}:00:00Z` });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "cleanup-user", membershipRole: "member", status: "active" });
+    await service.save(companyId, "cleanup-user", { provider: "openai", method: "subscription", name: "Scoped cleanup",
+      ownership: "personal", agentIds: [], allAgents: true, loginSessionId: "fixture" }, auth(10));
+    const persistentHomeRoot = path.join(home, "scoped-managed-homes", companyId);
+    const run = await prepareManagedAiRuntime(db, { ...input, adapterType: "codex_local", responsibleUserId: "cleanup-user",
+      binding: { provider: "openai", method: "subscription", mode: "responsible_user" }, config: {}, persistentHomeRoot });
+    const descriptor = JSON.parse(JSON.stringify(run.cleanupDescriptor));
+    expect(JSON.stringify(descriptor)).not.toContain("fixture-access");
+    const authPath = path.join(String(run.config.env.CODEX_HOME), "auth.json");
+    await writeFile(authPath, auth(11));
+    await expect(cleanupManagedAiRuntime(db, { root: persistentHomeRoot,
+      descriptor: { ...descriptor, ownershipToken: randomUUID() } })).rejects.toThrow("ownership mismatch");
+    await expect(cleanupManagedAiRuntime(db, { root: persistentHomeRoot,
+      descriptor: { ...descriptor, companyId: otherCompanyId } })).rejects.toThrow("binding mismatch");
+    await expect(cleanupManagedAiRuntime(db, { root: persistentHomeRoot,
+      descriptor: { ...descriptor, homeName: "../outside" } })).rejects.toThrow();
+    expect(await readFile(authPath, "utf8")).toBe(auth(11));
+    await cleanupManagedAiRuntime(db, { root: persistentHomeRoot, descriptor });
+    await expect(access(run.home!)).rejects.toThrow();
+    const selected = await service.select({ companyId, agentId, adapterType: "codex_local", userId: "cleanup-user",
+      binding: { provider: "openai", method: "subscription", mode: "responsible_user" } });
+    expect(await service.credential(selected)).toBe(auth(11));
+    await cleanupManagedAiRuntime(db, { root: persistentHomeRoot, descriptor });
+  });
+
   it("persists the freshest refreshed credential to its original grant across a same-account reconnect", async () => {
     const auth = (marker: string, hour: number) => JSON.stringify({ tokens: { account_id: "fixture-account", id_token: `id-${marker}`, access_token: `access-${marker}`, refresh_token: `refresh-${marker}` }, last_refresh: `2026-09-10T${hour}:00:00Z` });
     const intent = { provider: "openai" as const, method: "subscription" as const, name: "Refresh test", ownership: "personal" as const, agentIds: [], allAgents: true, loginSessionId: "fixture" };
