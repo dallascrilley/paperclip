@@ -1212,7 +1212,11 @@ describe("issue execution policy routes", () => {
     const reviewerId = "44444444-4444-4444-8444-444444444444";
     const strangerId = "66666666-6666-4666-8666-666666666666";
     const issueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    const agentActor = (agentId: string): TestActor => ({ type: "agent", agentId, companyId: "company-1", runId: null });
+    let activeActorAgentId = executorId;
+    const agentActor = (agentId: string): TestActor => {
+      activeActorAgentId = agentId;
+      return { type: "agent", agentId, companyId: "company-1", runId: "55555555-5555-4555-8555-555555555555" };
+    };
 
     function fixture(ownerType: "agent" | "user") {
       const owner = ownerType === "agent"
@@ -1233,6 +1237,12 @@ describe("issue execution policy routes", () => {
       };
       const decisions: any[] = [];
       let failInsert = false;
+      mockDbSelectWhere.mockImplementation(() => {
+        const rows = () => [{ id: "55555555-5555-4555-8555-555555555555", companyId: "company-1",
+          agentId: activeActorAgentId, contextSnapshot: { issueId }, permissions: null }];
+        const query = { then: (resolve: (rows: unknown[]) => unknown) => Promise.resolve(rows()).then(resolve) };
+        return { ...query, for: () => query };
+      });
       mockIssueService.getById.mockImplementation(async () => persisted);
       mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>, tx: any) => {
         const updated = { ...persisted, ...patch, updatedAt: new Date() };
@@ -1356,7 +1366,7 @@ describe("issue execution policy routes", () => {
       const f = fixture("agent");
       const res = await request(await createApp({ ...agentActor(reviewerId), companyId: "company-2" } as TestActor))
         .patch(`/api/issues/${issueId}`).send({ status: "done", comment: "Cross-company verdict" });
-      expect(res.status).toBe(403);
+      expect(res.status).toBe(404);
       expect(mockIssueService.update).not.toHaveBeenCalled();
       expect(f.decisions).toEqual([]);
     });
