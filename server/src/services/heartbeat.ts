@@ -20054,10 +20054,26 @@ export function heartbeatService(
     let readyResolve!: () => void;
     let readyReject!: (error: unknown) => void;
     const ready = new Promise<void>((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
+    let workerTerminalConsumed = false;
     const execution = (async () => {
       try {
         await registerAdapterExecutionControl(runId, control);
         const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
+        const assertFinalizationOwned = async () => {
+          const latest = await getRun(runId);
+          if (latest?.controllerBootId !== legacyControllerBootId || latest.companyId !== run.companyId) {
+            throw new LegacyAdapterControllerDetachedError();
+          }
+          if (latest.status === "cancelled") return;
+          if (latest.status === "running" && parseObject(latest.resultJson?.executionCancellation).state === "requested") {
+            const [owned] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.id, runId), eq(heartbeatRuns.controllerBootId, legacyControllerBootId),
+              eq(heartbeatRuns.status, "running"), sql`${heartbeatRuns.controllerLeaseExpiresAt} > clock_timestamp()`));
+            if (!owned) throw new LegacyAdapterControllerDetachedError();
+            return;
+          }
+          await lease.assertOwned();
+        };
         let outputSeq = claimed.run.lastOutputSeq;
         const onLog: AdapterExecutionContext["onLog"] = async (stream, chunk) => {
           await lease.assertOwned();
@@ -20094,6 +20110,7 @@ export function heartbeatService(
             }
           },
         });
+        workerTerminalConsumed = true;
         const issueContext = preparation.issueId ? await getIssueExecutionContext(run.companyId, preparation.issueId) : null;
         await finalizeAdapterRun({ run: claimed.run, agent, adapterResult,
           sessionCodec: getAdapterSessionCodec(agent.adapterType), previousSessionParams: preparation.previousSessionParams,
@@ -20105,7 +20122,7 @@ export function heartbeatService(
           signal: control.controller.signal, taskSessionReused: preparation.taskSessionReused,
           onControllerDetached: () => { throw new LegacyAdapterControllerDetachedError(); },
           finishOutput: async () => {
-            await lease.assertOwned();
+            await assertFinalizationOwned();
             const [tail] = await db.select().from(legacyAdapterTransports).where(eq(legacyAdapterTransports.runId, runId));
             if (!tail || tail.custodyId !== custody.custodyId) throw new LegacyAdapterControllerDetachedError();
             // A separate file preserves the original controller's host log.
@@ -20113,7 +20130,7 @@ export function heartbeatService(
               runId: `${runId}-custody-${legacyControllerBootId}` });
             let stdoutExcerpt = "", stderrExcerpt = "", seq = 0;
             await reconstructLegacyAdapterLogs({ directory, binding, committedCursor: tail.eventCursor,
-              assertOwned: () => lease.assertOwned(), append: async (stream, chunk) => {
+              assertOwned: assertFinalizationOwned, append: async (stream, chunk) => {
                 const sanitized = compactRunLogChunk(redactCurrentUserText(chunk, currentUserRedactionOptions));
                 if (stream === "stdout") stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitized);
                 else stderrExcerpt = appendExcerpt(stderrExcerpt, sanitized);
@@ -20122,8 +20139,9 @@ export function heartbeatService(
             const logSummary = await runLogStore.finalize(handle);
             const [updated] = await db.update(heartbeatRuns).set({ logStore: handle.store, logRef: handle.logRef,
               lastOutputBytes: logSummary.bytes }).where(and(eq(heartbeatRuns.id, runId),
-              eq(heartbeatRuns.controllerBootId, legacyControllerBootId), eq(heartbeatRuns.status, "running"),
-              sql`${heartbeatRuns.controllerLeaseExpiresAt} > clock_timestamp()`)).returning({ id: heartbeatRuns.id });
+              eq(heartbeatRuns.controllerBootId, legacyControllerBootId),
+              sql`((${heartbeatRuns.status} = 'running' and ${heartbeatRuns.controllerLeaseExpiresAt} > clock_timestamp())
+                or ${heartbeatRuns.status} = 'cancelled')`)).returning({ id: heartbeatRuns.id });
             if (!updated) throw new LegacyAdapterControllerDetachedError();
             return { logSummary, stdoutExcerpt, stderrExcerpt };
           },
@@ -20138,7 +20156,7 @@ export function heartbeatService(
         control.finish();
         if (adapterExecutionControls.get(runId) === control) adapterExecutionControls.delete(runId);
         const latest = await getRun(runId).catch(() => null);
-        if (latest && latest.controllerBootId === legacyControllerBootId && isHeartbeatRunTerminalStatus(latest.status)) {
+        if (workerTerminalConsumed && latest && latest.controllerBootId === legacyControllerBootId && isHeartbeatRunTerminalStatus(latest.status)) {
           await revokeHeartbeatRunGatewayTokens({ db, companyId: run.companyId, runId }).catch(error =>
             logger.warn({ err: error, runId }, "recovered legacy gateway-token cleanup failed"));
           await db.update(heartbeatRuns).set({ executionControlDeadlineAt: null }).where(and(
@@ -20410,7 +20428,7 @@ export function heartbeatService(
               eq(heartbeatRuns.id, run.id),
               eq(heartbeatRuns.status, status),
               ...(supervisedLegacyExecution ? [eq(heartbeatRuns.controllerBootId, legacyControllerBootId),
-                sql`${heartbeatRuns.controllerLeaseExpiresAt} > clock_timestamp()`] : []),
+                sql`(${heartbeatRuns.status} = 'cancelled' or ${heartbeatRuns.controllerLeaseExpiresAt} > clock_timestamp())`] : []),
             ),
           )
           .returning()

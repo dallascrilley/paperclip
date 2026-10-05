@@ -68,7 +68,7 @@ describe("replacement legacy host finalization", () => {
     expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId))).toHaveLength(0);
   });
 
-  it.each(["sleeping", "logging"] as const)("finalizes the same %s Codex executor through common host session and usage projection", async mode => {
+  it.each(["sleeping", "logging", "cancelled"] as const)("finalizes the same %s Codex executor through common host session and usage projection", async mode => {
     const runId = randomUUID(), previousBootId = randomUUID(), replacementBootId = legacyControllerBootId;
     const binding = { runId, companyId, agentId, adapterType: "codex_local" };
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "legacy",
@@ -86,6 +86,11 @@ describe("replacement legacy host finalization", () => {
       const fs = require('node:fs');
       fs.appendFileSync(${JSON.stringify(effects)}, 'started\\n');
       process.stdin.resume();
+      const stop = () => {
+        process.stdout.write(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'cancelled fixture tail'}})+'\\n');
+        process.exit(130);
+      };
+      process.on('SIGINT', stop); process.on('SIGTERM', stop);
       process.stdout.write(JSON.stringify({type:'thread.started',thread_id:'reattached-session'})+'\\n');
       const timer = setInterval(() => {
         ${mode === "logging" ? "process.stdout.write(JSON.stringify({type:'item.started',item:{type:'command_execution',command:'logging fixture'}})+'\\n');" : ""}
@@ -140,24 +145,35 @@ describe("replacement legacy host finalization", () => {
       const adoption = await heartbeat.reconcileHotRestartAdoption();
       expect(adoption).toMatchObject({ mode: "reported", adoptedRunIds: [runId], lostRunIds: [], skippedRunIds: [] });
       expect(await heartbeat.resumeSupervisedLegacyRun(runId)).toBe(false);
-      await fs.writeFile(release, "");
+      if (mode === "cancelled") await heartbeat.cancelRun(runId, "Stop recovered fixture");
+      else await fs.writeFile(release, "");
       await heartbeat.drainActiveRunExecutions();
       const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-      expect(after).toMatchObject({ status: "succeeded", processPid: before.processPid, processGroupId: before.processGroupId,
+      expect(after).toMatchObject({ status: mode === "cancelled" ? "cancelled" : "succeeded", processPid: before.processPid, processGroupId: before.processGroupId,
         controllerBootId: replacementBootId });
       const [tail] = await db.select().from(legacyAdapterTransports).where(eq(legacyAdapterTransports.runId, runId));
       expect(tail.eventCursor).toBeGreaterThan(previousCustody.eventCursor);
       const rows = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
-      expect(rows.some(row => JSON.stringify(row.payload).includes("turn.completed"))).toBe(true);
       expect(new Set(rows.map(row => row.seq)).size).toBe(rows.length);
       expect(await fs.readFile(effects, "utf8")).toBe("started\n");
-      expect(after).toMatchObject({ exitCode: 0, signal: null, sessionIdAfter: "reattached-session",
-        resultJson: { summary: "reattached result" }, usageJson: { inputTokens: 3, outputTokens: 5 } });
       const log = await heartbeat.readLog(runId, { limitBytes: 1024 * 1024 });
       expect(log.content).toContain("thread.started");
-      expect(log.content).toContain("turn.completed");
       expect(after.stdoutExcerpt).toContain("thread.started");
-      expect(after.stdoutExcerpt).toContain("turn.completed");
+      if (mode === "cancelled") {
+        expect(after).toMatchObject({ status: "cancelled", sessionIdAfter: "reattached-session",
+          resultJson: { executionCancellation: { state: "acknowledged", proof: "durable_adapter_worker_join",
+            custodyId: custody.custodyId } } });
+        expect(after.exitCode !== null || after.signal !== null).toBe(true);
+        expect(after.logBytes).toBeGreaterThan(0);
+        expect(after.logSha256).toMatch(/^[a-f0-9]{64}$/);
+        expect(await readDurableChildResult(handle.directory)).not.toBeNull();
+      } else {
+        expect(rows.some(row => JSON.stringify(row.payload).includes("turn.completed"))).toBe(true);
+        expect(after).toMatchObject({ exitCode: 0, signal: null, sessionIdAfter: "reattached-session",
+          resultJson: { summary: "reattached result" }, usageJson: { inputTokens: 3, outputTokens: 5 } });
+        expect(log.content).toContain("turn.completed");
+        expect(after.stdoutExcerpt).toContain("turn.completed");
+      }
       expect(rows.filter(row => row.eventType === "legacy_adapter_custody_claimed")).toHaveLength(1);
       // Explicit lease expiry in one process: source host finalization proof,
       // not installed hot restart or physical replacement-controller proof.

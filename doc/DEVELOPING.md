@@ -281,7 +281,12 @@ Remote execution, ACP engines and other legacy adapters retain their drain gate.
 Pre-change PID-only runs cannot acquire independent pipes or prepared custody
 retroactively. They must complete before a quiescent rollout. That rollout is
 not active-adoption proof. Recovery of ancillary workspace finalization, managed
-auth-home cleanup and cancellation boundaries remains under development. Native
+auth-home cleanup remains under development. A Stop on the attached replacement
+consumer records the bound exit tail without reviving the cancelled row. Running
+event ingestion still requires a live lease; cancelled tail ingestion requires
+the same company, agent, custody, cursor and controller identity. Replacement
+resource cleanup requires a consumed worker terminal receipt. Recovery after a
+controller disappears during Stop remains to be verified. Native
 source approval, full project gates and separate disposable installed restart
 proof remain required before a corrective activation handoff.
 

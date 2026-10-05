@@ -12,8 +12,8 @@ export class LegacyAdapterControllerDetachedError extends Error {
   constructor(cause?: unknown) { super("Supervised legacy adapter controller detached", { cause }); this.name = "LegacyAdapterControllerDetachedError"; }
 }
 
-/** Current-controller integration. Restart reattachment remains disabled until
- * prepared host finalization inputs and restart routing are implemented.
+/** Launch once under host custody, then consume through the same fenced path
+ * used by the replacement controller.
  */
 export async function executeSupervisedLegacyAdapter(input: {
   db: Db;
@@ -63,8 +63,8 @@ export async function executeSupervisedLegacyAdapter(input: {
 
 /** Consume an existing worker without adapter configuration, credentials or a
  * launch operation. The caller must first acquire custody; every committed
- * frame remains fenced by its controller lease. This alone is not heartbeat
- * recovery: prepared host finalization and log reconstruction are still needed.
+ * frame remains fenced by its controller identity and cursor. Running frames
+ * require a live lease; cancelled exit tails require the unchanged Stop owner.
  */
 export async function consumeSupervisedLegacyAdapter(input: {
   db: Db;
@@ -93,25 +93,50 @@ export async function consumeSupervisedLegacyAdapter(input: {
       binding.companyId, input.custodyId, binding.runId);
     let cursor = input.cursor;
     let cancelling = !owned;
-    if (cancelling) await cancelLegacyAdapterWorker(directory);
+    if (cancelling) {
+      await cancelLegacyAdapterWorker(directory);
+      const cancelledOwner = await commitLegacyAdapterEvents(input.db, { ...binding,
+        custodyId: input.custodyId, expectedCursor: cursor, nextCursor: cursor, events: [],
+        project: input.project, allowCancelled: true }, input.controllerBootId);
+      if (!cancelledOwner) throw new LegacyAdapterControllerDetachedError();
+      input.onReady?.();
+    }
     for (;;) {
       if (input.signal?.aborted) {
         if (!await input.cancellationRequested()) throw new LegacyAdapterControllerDetachedError();
         if (!cancelling) { await cancelLegacyAdapterWorker(directory); cancelling = true; }
       }
       const batch = await readLegacyAdapterEventBatch({ directory, binding, cursor });
+      const commit = () => commitLegacyAdapterEvents(input.db, { ...binding, custodyId: input.custodyId,
+        expectedCursor: cursor, nextCursor: batch.nextCursor, events: batch.events, project: input.project,
+        allowCancelled: cancelling }, input.controllerBootId);
+      let committed = await commit();
+      if (!committed && !cancelling && await input.cancellationRequested()) {
+        await cancelLegacyAdapterWorker(directory);
+        cancelling = true;
+        committed = await commit();
+      }
+      if (!committed) throw new LegacyAdapterControllerDetachedError();
+      // Stop already owns presentation. Retain its exit tail in the database;
+      // do not call running-only host progress or live-output callbacks.
       if (!cancelling) {
-        const committed = await commitLegacyAdapterEvents(input.db, { ...binding, custodyId: input.custodyId,
-          expectedCursor: cursor, nextCursor: batch.nextCursor, events: batch.events, project: input.project }, input.controllerBootId);
-        if (!committed) {
-          if (await input.cancellationRequested()) {
-            await cancelLegacyAdapterWorker(directory); cancelling = true;
-          } else throw new LegacyAdapterControllerDetachedError();
+        try { await input.onCommittedEvents?.(batch.events); }
+        catch (error) {
+          if (!input.signal?.aborted || !await input.cancellationRequested()) throw error;
+          await cancelLegacyAdapterWorker(directory);
+          cancelling = true;
         }
       }
-      if (!cancelling) await input.onCommittedEvents?.(batch.events);
       cursor = batch.nextCursor;
-      if (batch.terminal) return batch.terminal.adapterResult;
+      if (batch.terminal) {
+        const result = batch.terminal.adapterResult;
+        if (!cancelling) return result;
+        // The worker publishes only after parser/cleanup settlement and child
+        // join; the framing reader also requires the supervisor's close receipt.
+        return { ...result, resultJson: { ...result.resultJson,
+          executionCancellation: { state: "acknowledged", acknowledgedAt: batch.terminal.completedAt,
+            proof: "durable_adapter_worker_join", custodyId: input.custodyId } } };
+      }
       await new Promise(resolve => setTimeout(resolve, 25));
     }
   } catch (error) {

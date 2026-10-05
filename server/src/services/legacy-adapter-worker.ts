@@ -105,6 +105,9 @@ export async function runLegacyAdapterWorker(directory: string, input: LegacyAda
     await flush("stderr", true);
   }
   await sendQueue;
+  // Parser failure alone cannot certify executor termination. Do not publish
+  // a consumable result while the adapter still owns an unjoined child.
+  if (runningProcesses.has(input.runId)) throw new Error("Adapter worker executor has not joined");
   await writeAtomicReceipt(directory, {
     version: 1, runId: input.runId, companyId: input.agent.companyId,
     adapterType: input.agent.adapterType!,

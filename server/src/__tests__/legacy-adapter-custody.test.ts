@@ -148,6 +148,24 @@ describe("legacy transport database custody", () => {
     expect((await db.select().from(legacyAdapterTransports).where(eq(legacyAdapterTransports.runId, f.runId)))[0].eventCursor).toBe(0);
   });
 
+  it("retains a Stop exit tail only for its exact custody owner without reviving dispatch", async () => {
+    const f = await fixture();
+    await db.update(heartbeatRuns).set({ status: "cancelled", executionStage: "finalizing",
+      controllerLeaseExpiresAt: sql`clock_timestamp() - interval '1 second'` }).where(eq(heartbeatRuns.id, f.runId));
+    expect(await commitLegacyAdapterEvents(db, f)).toBeNull();
+    const cancelled = { ...f, allowCancelled: true };
+    expect(await commitLegacyAdapterEvents(db, cancelled, randomUUID())).toBeNull();
+    expect(await commitLegacyAdapterEvents(db, { ...cancelled, companyId: randomUUID() })).toBeNull();
+    expect(await commitLegacyAdapterEvents(db, { ...cancelled, custodyId: randomUUID() })).toBeNull();
+    expect(await commitLegacyAdapterEvents(db, cancelled)).not.toBeNull();
+    expect(await commitLegacyAdapterEvents(db, cancelled)).toBeNull();
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    expect(run).toMatchObject({ status: "cancelled", executionStage: "finalizing", processPid: null });
+    expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.runId))).toHaveLength(1);
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.runId));
+    expect(await commitLegacyAdapterEvents(db, { ...cancelled, expectedCursor: 20, nextCursor: 40 })).toBeNull();
+  });
+
   it("fences common legacy terminalization against stale or expired controllers", async () => {
     const f = await fixture();
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));

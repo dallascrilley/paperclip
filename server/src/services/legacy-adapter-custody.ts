@@ -1,7 +1,7 @@
 import { prepareLegacyAdapterFinalizationInputs, type LegacyAdapterFinalizationInputs } from "./legacy-adapter-finalization-inputs.js";
 import { isDeepStrictEqual } from "node:util";
 import { randomUUID } from "node:crypto";
-import { and, eq, gt, lte, sql } from "drizzle-orm";
+import { and, eq, lte, sql } from "drizzle-orm";
 import { agents, heartbeatRuns, legacyAdapterTransports, type Db } from "@paperclipai/db";
 import { legacyControllerBootId } from "./legacy-controller-lease.js";
 import { appendHeartbeatRunEvent, type AppendHeartbeatRunEventInput } from "./heartbeat-run-events.js";
@@ -11,12 +11,13 @@ import { SUPERVISED_LEGACY_ADAPTERS } from "./legacy-adapter-supervisor.js";
 type Binding = { companyId: string; runId: string; agentId: string; adapterType: string };
 type Transaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
-async function lockOwnedRun(tx: Transaction, binding: Binding, bootId: string) {
+async function lockOwnedRun(tx: Transaction, binding: Binding, bootId: string, allowCancelled = false) {
   const [run] = await tx.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.id, binding.runId), eq(heartbeatRuns.companyId, binding.companyId),
     eq(heartbeatRuns.agentId, binding.agentId), eq(heartbeatRuns.runtimeMode, "legacy"),
-    eq(heartbeatRuns.status, "running"), eq(heartbeatRuns.controllerBootId, bootId),
-    gt(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`),
+    eq(heartbeatRuns.controllerBootId, bootId),
+    sql`((${heartbeatRuns.status} = 'running' and ${heartbeatRuns.controllerLeaseExpiresAt} > clock_timestamp())
+      or (${allowCancelled} and ${heartbeatRuns.status} = 'cancelled'))`,
   )).for("update");
   if (!run) return null;
   const [agent] = await tx.select({ adapterType: agents.adapterType }).from(agents).where(and(
@@ -105,6 +106,9 @@ export async function claimExpiredLegacyAdapterCustody(db: Db, input: Binding & 
  */
 export async function commitLegacyAdapterEvents(db: Db, input: Binding & {
   custodyId: string;
+  // Terminal Stop does not transfer custody. Its exact controller can consume
+  // the bound exit tail, but cannot change the cancellation or dispatch stage.
+  allowCancelled?: boolean;
   expectedCursor: number;
   nextCursor: number;
   events: LegacyAdapterWorkerEvent[];
@@ -117,7 +121,8 @@ export async function commitLegacyAdapterEvents(db: Db, input: Binding & {
     throw new Error("Invalid legacy adapter custody cursor");
   }
   return db.transaction(async tx => {
-    if (!await lockOwnedRun(tx, input, bootId)) return null;
+    const run = await lockOwnedRun(tx, input, bootId, input.allowCancelled);
+    if (!run) return null;
     const [custody] = await tx.select().from(legacyAdapterTransports).where(and(
       eq(legacyAdapterTransports.runId, input.runId), eq(legacyAdapterTransports.companyId, input.companyId),
       eq(legacyAdapterTransports.agentId, input.agentId), eq(legacyAdapterTransports.adapterType, input.adapterType),
@@ -134,11 +139,11 @@ export async function commitLegacyAdapterEvents(db: Db, input: Binding & {
         runId: input.runId, companyId: input.companyId, agentId: input.agentId,
       });
       rows.push(appended.row);
-      if (event.kind === "spawn") await tx.update(heartbeatRuns).set({
+      if (run.status === "running" && event.kind === "spawn") await tx.update(heartbeatRuns).set({
         processPid: event.meta.pid, processGroupId: event.meta.processGroupId,
         processStartedAt: new Date(event.meta.startedAt), executionStage: "dispatching",
       }).where(eq(heartbeatRuns.id, input.runId));
-      if (event.kind === "dispatch") await tx.update(heartbeatRuns).set({ executionStage: "dispatching" }).where(eq(heartbeatRuns.id, input.runId));
+      if (run.status === "running" && event.kind === "dispatch") await tx.update(heartbeatRuns).set({ executionStage: "dispatching" }).where(eq(heartbeatRuns.id, input.runId));
     }
     // The database clock can cross expiry during a long batch. Roll back all
     // inserted events and sequence increments if authority expired meanwhile.
@@ -147,8 +152,8 @@ export async function commitLegacyAdapterEvents(db: Db, input: Binding & {
     }).where(and(eq(legacyAdapterTransports.runId, input.runId), sql`exists (
       select 1 from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.runId}
       and ${heartbeatRuns.controllerBootId} = ${bootId}
-      and ${heartbeatRuns.controllerLeaseExpiresAt} > clock_timestamp()
-      and ${heartbeatRuns.status} = 'running'
+      and ((${heartbeatRuns.controllerLeaseExpiresAt} > clock_timestamp() and ${heartbeatRuns.status} = 'running')
+        or (${Boolean(input.allowCancelled)} and ${heartbeatRuns.status} = 'cancelled'))
     )`)).returning();
     if (!advanced) throw new Error("Legacy adapter custody lease expired during ingestion");
     return { custody: advanced, rows };
