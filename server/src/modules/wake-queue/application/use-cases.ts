@@ -852,6 +852,10 @@ export function createAdmitWakeBehindIssueExecution(deps: {
         companyId: input.companyId,
         activeExecutionRunId: target.id,
         mergedContextSnapshot,
+        baseContextSnapshot:
+          target.contextSnapshot && typeof target.contextSnapshot === "object"
+            ? (target.contextSnapshot as Record<string, unknown>)
+            : {},
         ...(input.durableReceipt
           ? { durableReceipt: input.durableReceipt }
           : {}),

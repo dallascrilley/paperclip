@@ -160,3 +160,38 @@ export function enrichPromotedWakeContext(
 
   return { contextSnapshot, taskKey };
 }
+
+function readWatchdogStopFingerprint(context: Record<string, unknown> | null | undefined): string | null {
+  const taskWatchdog = context?.taskWatchdog;
+  if (taskWatchdog && typeof taskWatchdog === "object" && !Array.isArray(taskWatchdog)) {
+    const nested = readNonEmptyString((taskWatchdog as Record<string, unknown>).stopFingerprint);
+    if (nested) return nested;
+  }
+  return readNonEmptyString(context?.stopFingerprint);
+}
+
+/**
+ * A coalesce merge is computed from a read of the run's context and written later. If
+ * the task-watchdog fingerprint advance (a locked write on the same row) landed in
+ * between, writing the merge back would restore the stale fingerprint. When the merge did
+ * not itself change the fingerprint (`merged` still equals `base`) but the locked
+ * `current` row moved on, carry the current fingerprint into the merge. A merge that
+ * deliberately carries a different fingerprint keeps it.
+ */
+export function preserveAdvancedWatchdogStopFingerprint(
+  base: Record<string, unknown>,
+  current: Record<string, unknown>,
+  merged: Record<string, unknown>,
+): Record<string, unknown> {
+  const baseFingerprint = readWatchdogStopFingerprint(base);
+  const currentFingerprint = readWatchdogStopFingerprint(current);
+  if (!currentFingerprint || currentFingerprint === baseFingerprint) return merged;
+  if (readWatchdogStopFingerprint(merged) !== baseFingerprint) return merged;
+  const next: Record<string, unknown> = { ...merged };
+  const taskWatchdog = merged.taskWatchdog;
+  if (taskWatchdog && typeof taskWatchdog === "object" && !Array.isArray(taskWatchdog)) {
+    next.taskWatchdog = { ...(taskWatchdog as Record<string, unknown>), stopFingerprint: currentFingerprint };
+  }
+  if (typeof merged.stopFingerprint === "string") next.stopFingerprint = currentFingerprint;
+  return next;
+}

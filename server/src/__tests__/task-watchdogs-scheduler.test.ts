@@ -638,7 +638,19 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
         const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id));
         return (row!.contextSnapshot as { taskWatchdog: { stopFingerprint: string } }).taskWatchdog.stopFingerprint;
       };
-      return { companyId, sourceId, agentId, interactionId, secondInteractionId, service, stopFingerprint, runId: run!.id, scope, recordedFingerprint };
+      const baselineFor = async (fingerprint: string) => {
+        const revalidated = await service.revalidateMutationScope(scope(fingerprint));
+        if (revalidated.classification?.state !== "stopped") throw new Error("Expected stopped classification");
+        return revalidated.classification.stopSnapshot;
+      };
+      const baseline = await baselineFor(stopFingerprint);
+      const own = (fingerprint: string, removableInteractionId: string | null, from = baseline) =>
+        service.advanceMutationScopeFingerprint(scope(fingerprint), run!.id, {
+          baseline: from,
+          targetIssueId: sourceId,
+          removableInteractionId,
+        });
+      return { companyId, sourceId, agentId, interactionId, secondInteractionId, service, stopFingerprint, runId: run!.id, scope, recordedFingerprint, baseline, baselineFor, own };
     }
 
     it("lets a recovery decision follow the run's own interaction withdrawal", async () => {
@@ -651,15 +663,16 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
       expect(stale.allowed).toBe(false);
       expect(stale.reason).toContain("stop fingerprint changed");
 
-      const advanced = await t.service.advanceMutationScopeFingerprint(t.scope(t.stopFingerprint), t.runId);
+      const advanced = await t.own(t.stopFingerprint, t.interactionId);
       expect(advanced).toMatchObject({ advanced: true, from: t.stopFingerprint });
       const recorded = await t.recordedFingerprint();
       expect(recorded).not.toBe(t.stopFingerprint);
       expect((await t.service.revalidateMutationScope(t.scope(recorded))).allowed).toBe(true);
 
       // A second own write (the other pending card) chains the same way.
+      const secondBaseline = await t.baselineFor(recorded);
       await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.id, t.secondInteractionId));
-      const chained = await t.service.advanceMutationScopeFingerprint(t.scope(recorded), t.runId);
+      const chained = await t.own(recorded, t.secondInteractionId, secondBaseline);
       expect(chained.advanced).toBe(true);
       expect((await t.service.revalidateMutationScope(t.scope(await t.recordedFingerprint()))).allowed).toBe(true);
     });
@@ -667,7 +680,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     it("still rejects an external change made after the run's own write", async () => {
       const t = await setup();
       await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.id, t.interactionId));
-      await t.service.advanceMutationScopeFingerprint(t.scope(t.stopFingerprint), t.runId);
+      await t.own(t.stopFingerprint, t.interactionId);
       const recorded = await t.recordedFingerprint();
 
       await seedPendingInteraction(t.companyId, t.sourceId, t.agentId);
@@ -677,11 +690,85 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
       expect(revalidated.reason).toContain("stop fingerprint changed");
     });
 
+    async function revalidatedBaseline(t: Awaited<ReturnType<typeof setup>>) {
+      const revalidated = await t.service.revalidateMutationScope(t.scope(t.stopFingerprint));
+      if (revalidated.classification?.state !== "stopped") throw new Error("Expected stopped classification");
+      return revalidated.classification.stopSnapshot;
+    }
+
+    it("advances over exactly the withdrawn interaction when a baseline is supplied", async () => {
+      const t = await setup();
+      const baseline = await revalidatedBaseline(t);
+      await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.id, t.interactionId));
+
+      const result = await t.service.advanceMutationScopeFingerprint(t.scope(t.stopFingerprint), t.runId, {
+        baseline,
+        targetIssueId: t.sourceId,
+        removableInteractionId: t.interactionId,
+      });
+
+      expect(result.advanced).toBe(true);
+      expect((await t.service.revalidateMutationScope(t.scope(await t.recordedFingerprint()))).allowed).toBe(true);
+    });
+
+    it("refuses to absorb an external interaction created between revalidation and advance", async () => {
+      const t = await setup();
+      const baseline = await revalidatedBaseline(t);
+      await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.id, t.interactionId));
+      // External actor creates a new pending card inside the revalidation-to-advance window.
+      await seedPendingInteraction(t.companyId, t.sourceId, t.agentId);
+
+      const result = await t.service.advanceMutationScopeFingerprint(t.scope(t.stopFingerprint), t.runId, {
+        baseline,
+        targetIssueId: t.sourceId,
+        removableInteractionId: t.interactionId,
+      });
+
+      expect(result).toMatchObject({ advanced: false, reason: "external_change" });
+      expect(await t.recordedFingerprint()).toBe(t.stopFingerprint);
+      // The run's next write is rejected exactly as for any external change.
+      expect((await t.service.revalidateMutationScope(t.scope(t.stopFingerprint))).allowed).toBe(false);
+    });
+
+    it("refuses to absorb an external resolution of a different interaction in the window", async () => {
+      const t = await setup();
+      const baseline = await revalidatedBaseline(t);
+      await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.id, t.interactionId));
+      await db.update(issueThreadInteractions).set({ status: "accepted" }).where(eq(issueThreadInteractions.id, t.secondInteractionId));
+
+      const result = await t.service.advanceMutationScopeFingerprint(t.scope(t.stopFingerprint), t.runId, {
+        baseline,
+        targetIssueId: t.sourceId,
+        removableInteractionId: t.interactionId,
+      });
+
+      expect(result).toMatchObject({ advanced: false, reason: "external_change" });
+      expect(await t.recordedFingerprint()).toBe(t.stopFingerprint);
+    });
+
+    it("refuses to absorb a change to another issue in the watched subtree", async () => {
+      const t = await setup();
+      const childId = await seedIssue(t.companyId, { identifier: "WDOG-OWNWRITE-CHILD", status: "blocked", parentId: t.sourceId });
+      const baseline = await revalidatedBaseline(t);
+      await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.id, t.interactionId));
+      // External actor changes a sibling leaf (not the mutation target).
+      await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, childId));
+
+      const result = await t.service.advanceMutationScopeFingerprint(t.scope(t.stopFingerprint), t.runId, {
+        baseline,
+        targetIssueId: t.sourceId,
+        removableInteractionId: t.interactionId,
+      });
+
+      expect(result).toMatchObject({ advanced: false, reason: "external_change" });
+      expect(await t.recordedFingerprint()).toBe(t.stopFingerprint);
+    });
+
     it("does not advance for a run that was never authorized with the current fingerprint", async () => {
       const t = await setup();
       await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.id, t.interactionId));
 
-      const result = await t.service.advanceMutationScopeFingerprint(t.scope("task_watchdog_stop:other"), t.runId);
+      const result = await t.own("task_watchdog_stop:other", t.interactionId);
 
       expect(result).toMatchObject({ advanced: false, reason: "run_fingerprint_moved" });
       expect(await t.recordedFingerprint()).toBe(t.stopFingerprint);
@@ -689,17 +776,17 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
 
     it("is idempotent when nothing changed or the advance is repeated", async () => {
       const t = await setup();
-      expect(await t.service.advanceMutationScopeFingerprint(t.scope(t.stopFingerprint), t.runId))
+      expect(await t.own(t.stopFingerprint, t.interactionId))
         .toMatchObject({ advanced: false, reason: "unchanged" });
 
       await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.id, t.interactionId));
-      const first = await t.service.advanceMutationScopeFingerprint(t.scope(t.stopFingerprint), t.runId);
+      const first = await t.own(t.stopFingerprint, t.interactionId);
       expect(first.advanced).toBe(true);
       const recorded = await t.recordedFingerprint();
 
-      expect(await t.service.advanceMutationScopeFingerprint(t.scope(t.stopFingerprint), t.runId))
+      expect(await t.own(t.stopFingerprint, t.interactionId))
         .toMatchObject({ advanced: false, reason: "run_fingerprint_moved" });
-      expect(await t.service.advanceMutationScopeFingerprint(t.scope(recorded), t.runId))
+      expect(await t.own(recorded, t.interactionId, await t.baselineFor(recorded)))
         .toMatchObject({ advanced: false, reason: "unchanged" });
       expect(await t.recordedFingerprint()).toBe(recorded);
     });
@@ -714,7 +801,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
         contextSnapshot: { issueId: t.sourceId },
       });
 
-      const result = await t.service.advanceMutationScopeFingerprint(t.scope(t.stopFingerprint), t.runId);
+      const result = await t.own(t.stopFingerprint, t.interactionId);
 
       expect(result).toMatchObject({ advanced: false, reason: "not_stopped" });
       expect(await t.recordedFingerprint()).toBe(t.stopFingerprint);

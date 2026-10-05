@@ -39,7 +39,10 @@ import {
   withQueuedCommentIdsInWakePayload,
 } from "../../../services/issue-queued-comment-queue.js";
 import { extractWakeCommentIds } from "../../run-dispatch/index.js";
-import { hasInteractionContinuationWakeContext } from "../domain/context.js";
+import {
+  hasInteractionContinuationWakeContext,
+  preserveAdvancedWatchdogStopFingerprint,
+} from "../domain/context.js";
 import { decidePreDrain, type PreDrainFacts } from "../domain/policy.js";
 import {
   EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
@@ -912,9 +915,32 @@ export function createWakeAdmissionWriter(): WakeAdmissionWriter {
     async coalesceIntoActiveExecutionRun(scope, input) {
       const tx = requireAdmissionTx(scope, input.companyId);
       const now = new Date();
+      let contextSnapshot = input.mergedContextSnapshot;
+      if (input.baseContextSnapshot) {
+        // Lock the row so a concurrent task-watchdog fingerprint advance serializes with
+        // this write instead of being overwritten by a merge computed from an older read.
+        const locked = await tx
+          .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.id, input.activeExecutionRunId),
+              eq(heartbeatRuns.companyId, input.companyId),
+            ),
+          )
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (locked) {
+          contextSnapshot = preserveAdvancedWatchdogStopFingerprint(
+            input.baseContextSnapshot,
+            parseObject(locked.contextSnapshot),
+            input.mergedContextSnapshot,
+          );
+        }
+      }
       const mergedRun = await tx
         .update(heartbeatRuns)
-        .set({ contextSnapshot: input.mergedContextSnapshot, updatedAt: now })
+        .set({ contextSnapshot, updatedAt: now })
         .where(
           and(
             eq(heartbeatRuns.id, input.activeExecutionRunId),

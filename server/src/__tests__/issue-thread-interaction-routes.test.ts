@@ -61,6 +61,7 @@ vi.mock("../services/native-runtime/native-question-bridge.js", () => ({
 const mockQuestionResponseDeliveries = vi.hoisted(() => ({
   deliver: vi.fn(async () => null),
 }));
+const STOP_SNAPSHOT = vi.hoisted(() => ({ version: 2, fingerprint: "stop-1", materialLeaves: [], waitsByIssueId: {} }));
 const mockAdvanceMutationScopeFingerprint = vi.hoisted(() => vi.fn(async () => ({ advanced: false, reason: "unchanged" })));
 const mockResolveTaskWatchdogMutationScope = vi.hoisted(() => vi.fn(async () => ({ kind: "none" })));
 const mockResolveCoreTrustPreset = vi.hoisted(() => vi.fn(() => ({ kind: "standard" })));
@@ -228,7 +229,11 @@ function registerModuleMocks() {
       getActiveForIssue: vi.fn(async () => null),
       upsertForIssue: vi.fn(),
       disableForIssue: vi.fn(async () => null),
-      revalidateMutationScope: vi.fn(async (scope: unknown) => ({ allowed: true, scope })),
+      revalidateMutationScope: vi.fn(async (scope: unknown) => ({
+        allowed: true,
+        scope,
+        classification: { state: "stopped", stopFingerprint: "stop-1", stopSnapshot: STOP_SNAPSHOT },
+      })),
       advanceMutationScopeFingerprint: mockAdvanceMutationScopeFingerprint,
     }),
     logActivity: mockLogActivity,
@@ -1079,7 +1084,11 @@ describe.sequential("issue thread interaction routes", () => {
       .send({});
     expect(res.status).toBe(200);
     expect(mockAdvanceMutationScopeFingerprint).toHaveBeenCalledTimes(1);
-    expect(mockAdvanceMutationScopeFingerprint).toHaveBeenCalledWith(scope, RUN_WATCHDOG);
+    expect(mockAdvanceMutationScopeFingerprint).toHaveBeenCalledWith(scope, RUN_WATCHDOG, {
+      baseline: STOP_SNAPSHOT,
+      targetIssueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      removableInteractionId: "interaction-withdraw",
+    });
   });
 
   it("rejects withdrawal by low-trust actors", async () => {

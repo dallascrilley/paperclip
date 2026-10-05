@@ -418,6 +418,11 @@ export interface WakeAdmissionWriter {
       companyId: string;
       activeExecutionRunId: string;
       mergedContextSnapshot: Record<string, unknown>;
+      /**
+       * The run context `mergedContextSnapshot` was computed from. The writer re-reads the
+       * row under lock and keeps a task-watchdog fingerprint advance that landed since.
+       */
+      baseContextSnapshot?: Record<string, unknown>;
       durableReceipt?: DurableWakeAdmissionReceipt;
       agentId: string;
       source: string;

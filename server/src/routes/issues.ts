@@ -209,6 +209,7 @@ import {
   taskWatchdogScopeAllowsIssueMutation,
 } from "../services/task-watchdog-scope.js";
 import type {
+  TaskWatchdogOwnWriteTarget,
   TaskWatchdogServiceDeps,
   taskWatchdogService,
 } from "../services/task-watchdogs.js";
@@ -567,7 +568,7 @@ function noopTaskWatchdogService(): TaskWatchdogService {
     }),
     advanceMutationScopeFingerprint: async () => ({
       advanced: false as const,
-      reason: "watchdog_inactive" as const,
+      reason: "watchdog_inactive" as "watchdog_inactive" | "external_change",
     }),
   };
 }
@@ -5430,7 +5431,14 @@ export function issueRoutes(
       Awaited<ReturnType<typeof resolveTaskWatchdogMutationScope>>,
       { kind: "watchdog" }
     >,
+    revalidated: Awaited<ReturnType<TaskWatchdogService["revalidateMutationScope"]>>,
+    target: TaskWatchdogOwnWriteTarget,
   ) {
+    const baseline =
+      revalidated.classification?.state === "stopped"
+        ? revalidated.classification.stopSnapshot
+        : null;
+    if (!baseline) return;
     if (taskWatchdogOwnWriteArmed.has(res)) return;
     taskWatchdogOwnWriteArmed.add(res);
     const originalEnd = res.end.bind(res) as (...args: unknown[]) => Response;
@@ -5441,7 +5449,15 @@ export function issueRoutes(
       res.end = originalEnd as Response["end"];
       if (res.statusCode >= 400) return originalEnd(...args);
       void taskWatchdogsSvc
-        .advanceMutationScopeFingerprint(scope, scope.runId)
+        .advanceMutationScopeFingerprint(scope, scope.runId, { ...target, baseline })
+        .then((result) => {
+          if (!result.advanced && result.reason === "external_change") {
+            logger.info(
+              { watchdogId: scope.watchdogId, runId: scope.runId },
+              "task watchdog own-write fingerprint not advanced: subtree changed outside the mutation target",
+            );
+          }
+        })
         .catch((err: unknown) => {
           logger.warn(
             { err, watchdogId: scope.watchdogId, runId: scope.runId },
@@ -5466,7 +5482,9 @@ export function issueRoutes(
 
     const revalidated = await taskWatchdogsSvc.revalidateMutationScope(scope);
     if (revalidated.allowed) {
-      armTaskWatchdogOwnWriteAdvance(res, scope);
+      armTaskWatchdogOwnWriteAdvance(res, scope, revalidated, {
+        targetIssueId: issue.id,
+      });
       return true;
     }
     res.status(409).json({
@@ -5656,7 +5674,13 @@ export function issueRoutes(
             "This issue-thread interaction is outside the current watchdog scope",
         });
       }
-      armTaskWatchdogOwnWriteAdvance(res, watchdogScope);
+      armTaskWatchdogOwnWriteAdvance(res, watchdogScope, revalidated, {
+        targetIssueId: issue.id,
+        removableInteractionId:
+          typeof req.params.interactionId === "string"
+            ? req.params.interactionId
+            : null,
+      });
       return true;
     }
 

@@ -103,7 +103,7 @@ const mockTaskWatchdogService = vi.hoisted(() => ({
   getActiveForIssue: vi.fn(async () => null),
   revalidateMutationScope: vi.fn(async () => ({
     allowed: true,
-    classification: { state: "stopped", stopFingerprint: "task_watchdog_stop:test" },
+    classification: { state: "stopped", stopFingerprint: "task_watchdog_stop:test", stopSnapshot: { version: 2, fingerprint: "task_watchdog_stop:test", materialLeaves: [], waitsByIssueId: {} } },
   })),
   advanceMutationScopeFingerprint: vi.fn(async () => ({ advanced: false, reason: "unchanged" })),
   reconcileForIssueAndAncestors: vi.fn(async () => ({
@@ -559,7 +559,11 @@ describe("agent issue mutation checkout ownership", () => {
     mockTaskWatchdogService.revalidateMutationScope.mockReset();
     mockTaskWatchdogService.revalidateMutationScope.mockResolvedValue({
       allowed: true,
-      classification: { state: "stopped", stopFingerprint: "task_watchdog_stop:test" },
+      classification: {
+        state: "stopped",
+        stopFingerprint: "task_watchdog_stop:test",
+        stopSnapshot: { version: 2, fingerprint: "task_watchdog_stop:test", materialLeaves: [], waitsByIssueId: {} },
+      },
     });
     mockTaskWatchdogService.reconcileForIssueAndAncestors.mockReset();
     mockTaskWatchdogService.reconcileForIssueAndAncestors.mockResolvedValue({
@@ -2715,6 +2719,10 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockTaskWatchdogService.advanceMutationScopeFingerprint).toHaveBeenCalledWith(
         expect.objectContaining({ kind: "watchdog", stopFingerprint: "task_watchdog_stop:test", runId: watchdogRunId }),
         watchdogRunId,
+        expect.objectContaining({
+          targetIssueId: issueId,
+          baseline: expect.objectContaining({ fingerprint: "task_watchdog_stop:test" }),
+        }),
       );
     });
 

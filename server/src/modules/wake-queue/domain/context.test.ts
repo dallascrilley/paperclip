@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { enrichPromotedWakeContext } from "./context.js";
+import { enrichPromotedWakeContext, preserveAdvancedWatchdogStopFingerprint } from "./context.js";
 
 describe("enrichPromotedWakeContext", () => {
   it("clears stale derived comment projections when the canonical id list is empty, but keeps an independent interaction continuation", () => {
@@ -120,5 +120,35 @@ describe("enrichPromotedWakeContext", () => {
     });
     expect(result.contextSnapshot.acceptedPlanWakeRouting).toEqual({ targetAgentId: "agent-1" });
     expect(result.contextSnapshot.workspaceRefreshReason).toBe("accepted_plan_confirmation");
+  });
+});
+
+describe("preserveAdvancedWatchdogStopFingerprint", () => {
+  const base = { taskWatchdog: { watchedIssueId: "w", stopFingerprint: "fp-old" }, stopFingerprint: "fp-old" };
+
+  it("carries an advanced fingerprint into a merge computed from the older read", () => {
+    const current = { taskWatchdog: { watchedIssueId: "w", stopFingerprint: "fp-new" }, stopFingerprint: "fp-new" };
+    const merged = { ...base, commentId: "c1" };
+    expect(preserveAdvancedWatchdogStopFingerprint(base, current, merged)).toEqual({
+      commentId: "c1",
+      taskWatchdog: { watchedIssueId: "w", stopFingerprint: "fp-new" },
+      stopFingerprint: "fp-new",
+    });
+  });
+
+  it("leaves the merge alone when the row did not move", () => {
+    const merged = { ...base, commentId: "c1" };
+    expect(preserveAdvancedWatchdogStopFingerprint(base, base, merged)).toBe(merged);
+  });
+
+  it("keeps a fingerprint the merge deliberately changed", () => {
+    const current = { taskWatchdog: { watchedIssueId: "w", stopFingerprint: "fp-new" } };
+    const merged = { taskWatchdog: { watchedIssueId: "w", stopFingerprint: "fp-incoming" } };
+    expect(preserveAdvancedWatchdogStopFingerprint(base, current, merged)).toBe(merged);
+  });
+
+  it("ignores runs that carry no watchdog fingerprint", () => {
+    const merged = { commentId: "c1" };
+    expect(preserveAdvancedWatchdogStopFingerprint({}, {}, merged)).toBe(merged);
   });
 });

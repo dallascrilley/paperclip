@@ -876,6 +876,44 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
       expect(wakeRows).toHaveLength(0);
     });
 
+    // DAL-14: a task-watchdog fingerprint advance that lands between the coalesce read
+    // and write must survive the coalesce merge.
+    it("keeps a task-watchdog fingerprint advance that landed after the coalesce merge was computed", async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent({ companyId });
+      const base = { taskKey: "issue-1", taskWatchdog: { watchedIssueId: "w", stopFingerprint: "task_watchdog_stop:old" } };
+      const runId = await seedRun({ companyId, agentId, status: "running", contextSnapshot: base });
+      // The advance writes the run row after the coalescing caller read `base`.
+      await db
+        .update(heartbeatRuns)
+        .set({ contextSnapshot: { ...base, taskWatchdog: { ...base.taskWatchdog, stopFingerprint: "task_watchdog_stop:new" } } })
+        .where(eq(heartbeatRuns.id, runId));
+      const writer = createWakeAdmissionWriter();
+
+      await db.transaction(async (tx) => {
+        const scope = createAdmissionTransactionScope(companyId, tx as unknown as Db);
+        await writer.coalesceIntoActiveExecutionRun(scope, {
+          companyId,
+          activeExecutionRunId: runId,
+          mergedContextSnapshot: { ...base, commentId: "c1" },
+          baseContextSnapshot: base,
+          agentId,
+          source: "on_demand",
+          triggerDetail: null,
+          payload: null,
+          requestedByActorType: "user",
+          requestedByActorId: null,
+          idempotencyKey: null,
+        });
+      });
+
+      const runRow = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0];
+      expect(runRow?.contextSnapshot).toMatchObject({
+        commentId: "c1",
+        taskWatchdog: { stopFingerprint: "task_watchdog_stop:new" },
+      });
+    });
+
     // Review test (d): a transaction-port call cannot use the root database
     // executor. The module rejects a missing scope handle and a mismatched
     // scope handle, and neither case writes a row.

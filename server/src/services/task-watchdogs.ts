@@ -356,6 +356,58 @@ function canonicalJson(value: unknown): string {
       : val);
 }
 
+export type TaskWatchdogOwnWriteTarget = {
+  /** The issue the run's mutation targets. Only this issue's leaf may change. */
+  targetIssueId: string;
+  /**
+   * Set when the mutation resolves one pending interaction. The target leaf may then lose
+   * exactly this interaction id and nothing else.
+   */
+  removableInteractionId?: string | null;
+};
+
+/**
+ * True when `after` differs from `before` only in ways the run's own mutation explains:
+ * every leaf and wait other than the target issue's is identical, and the target's leaf
+ * changes only as the mutation allows. This is what lets a run's own write advance its
+ * fingerprint without also absorbing a concurrent change by another actor.
+ */
+export function snapshotDeltaConfinedToMutation(
+  before: TaskWatchdogStopSnapshot,
+  after: TaskWatchdogStopSnapshot,
+  target: TaskWatchdogOwnWriteTarget,
+) {
+  const beforeLeaves = new Map(before.materialLeaves.map((leaf) => [leaf.issueId, leaf]));
+  const afterLeaves = new Map(after.materialLeaves.map((leaf) => [leaf.issueId, leaf]));
+  for (const issueId of new Set([...beforeLeaves.keys(), ...afterLeaves.keys()])) {
+    if (issueId === target.targetIssueId) continue;
+    const a = beforeLeaves.get(issueId);
+    const b = afterLeaves.get(issueId);
+    if ((a == null) !== (b == null)) return false;
+    if (a && b && canonicalJson(a) !== canonicalJson(b)) return false;
+  }
+  for (const issueId of new Set([...Object.keys(before.waitsByIssueId), ...Object.keys(after.waitsByIssueId)])) {
+    if (issueId === target.targetIssueId) continue;
+    if (canonicalJson(before.waitsByIssueId[issueId] ?? null) !== canonicalJson(after.waitsByIssueId[issueId] ?? null)) {
+      return false;
+    }
+  }
+
+  const removable = target.removableInteractionId ?? null;
+  if (removable === null) return true; // issue-level mutation: the target issue is the mutation's own subject.
+  const a = beforeLeaves.get(target.targetIssueId);
+  const b = afterLeaves.get(target.targetIssueId);
+  if (!a || !b) return false;
+  // Interaction resolution: the leaf may only lose the resolved interaction id.
+  const expectedInteractionIds = a.pendingInteractionIds.filter((id) => id !== removable);
+  const sameWithoutInteractions = canonicalJson({ ...a, pendingInteractionIds: [] }) === canonicalJson({ ...b, pendingInteractionIds: [] });
+  if (!sameWithoutInteractions) return false;
+  const afterIds = new Set(b.pendingInteractionIds);
+  return afterIds.size <= expectedInteractionIds.length &&
+    b.pendingInteractionIds.every((id) => expectedInteractionIds.includes(id)) &&
+    expectedInteractionIds.every((id) => afterIds.has(id));
+}
+
 function isShrinkOfReviewedSnapshot(
   current: TaskWatchdogStopSnapshot,
   reviewed: TaskWatchdogStopSnapshot | null | undefined,
@@ -1663,11 +1715,16 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
    * changed the stop-fingerprint inputs.
    *
    * The caller must have just passed `revalidateMutationScope` for the same
-   * `scope.stopFingerprint`. The new fingerprint is only recorded when the subtree is
-   * still stopped, and only when the run still holds the fingerprint it was authorized
-   * with (compare-and-set). A change by another actor that lands in the short window
-   * between the revalidation and this call is absorbed; any change after it makes the
-   * next revalidation stale as before.
+   * `scope.stopFingerprint` and supplies the stop snapshot that revalidation hashed
+   * (`options.baseline`). The new fingerprint is only recorded when
+   *  - the subtree is still stopped,
+   *  - the difference between the baseline and the current snapshot is confined to the
+   *    mutation target (`snapshotDeltaConfinedToMutation`), so a change by another
+   *    actor that landed between the revalidation and this call is not absorbed, and
+   *  - the run still holds the fingerprint it was authorized with (row-locked
+   *    compare-and-set).
+   * A refused advance leaves the run on its old fingerprint, so its next mutation is
+   * rejected as stale and a fresh wake recovers it.
    */
   async function advanceMutationScopeFingerprint(
     scope: {
@@ -1678,6 +1735,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
       stopFingerprint: string | null;
     },
     runId: string,
+    options: TaskWatchdogOwnWriteTarget & { baseline: TaskWatchdogStopSnapshot },
   ) {
     if (!scope.stopFingerprint) return { advanced: false as const, reason: "missing_fingerprint" as const };
     const watchdog = await db
@@ -1696,6 +1754,9 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
     if (classification.state !== "stopped") return { advanced: false as const, reason: "not_stopped" as const };
     const nextFingerprint = classification.stopFingerprint;
     if (nextFingerprint === scope.stopFingerprint) return { advanced: false as const, reason: "unchanged" as const };
+    if (!snapshotDeltaConfinedToMutation(options.baseline, classification.stopSnapshot, options)) {
+      return { advanced: false as const, reason: "external_change" as const };
+    }
 
     return db.transaction(async (tx) => {
       const run = await tx

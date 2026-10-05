@@ -515,6 +515,7 @@ import {
 } from "../modules/run-dispatch/index.js";
 import {
   createWakeQueue,
+  preserveAdvancedWatchdogStopFingerprint,
   WakeQueueApplicationError,
   type IssueSnapshot as WakeQueueIssueSnapshot,
   type PostCommitEffect as WakeQueuePostCommitEffect,
@@ -28079,15 +28080,31 @@ export function heartbeatService(
             coalescedTargetRun.status === "scheduled_retry",
         },
       );
-      const mergedRun = await db
-        .update(heartbeatRuns)
-        .set({
-          contextSnapshot: mergedContextSnapshot,
-          updatedAt: new Date(),
-        })
-        .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
-        .returning()
-        .then((rows) => rows[0] ?? coalescedTargetRun);
+      // Lock the row and keep a task-watchdog fingerprint advance that landed after the
+      // merge was computed, instead of overwriting it with the earlier read.
+      const mergedRun = await db.transaction(async (tx) => {
+        const locked = await tx
+          .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        return tx
+          .update(heartbeatRuns)
+          .set({
+            contextSnapshot: locked
+              ? preserveAdvancedWatchdogStopFingerprint(
+                  parseObject(coalescedTargetRun.contextSnapshot),
+                  parseObject(locked.contextSnapshot),
+                  mergedContextSnapshot,
+                )
+              : mergedContextSnapshot,
+            updatedAt: new Date(),
+          })
+          .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
+          .returning()
+          .then((rows) => rows[0] ?? coalescedTargetRun);
+      });
 
       await db.insert(agentWakeupRequests).values({
         ...durableReceiptFields,
