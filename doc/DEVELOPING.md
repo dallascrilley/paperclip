@@ -256,6 +256,21 @@ requires a selective drain for these CLI runs (`active_legacy_pipe_run`) and for
 server-stdio ACP runs (`active_acp_run`). A mixed ACP/CLI restart drains both sets.
 Native Runner recovery retains its separate ownership path.
 
+The experimental server flag `PAPERCLIP_ENABLE_LEGACY_SUPERVISION=1` selects an
+independent worker for recognized local `codex_local` CLI execution. The worker
+owns the adapter parser and its detached executor. Host custody is reserved
+before launch; events and byte cursors commit under the legacy controller lease.
+The original controller forwards live logs and feeds the bound result through
+the common session, usage and run finalizer. A recorded cancellation requests
+worker cleanup; lost controller authority preserves the worker and custody.
+The flag is off by default and does not select remote or ACP execution.
+
+This flag is an implementation checkpoint, not an active-restart activation
+route. Immutable host finalization inputs, replacement lease transfer and result
+reattachment remain required. The selective restart drain still applies to these
+runs. Source approval and separate disposable installed restart proof are also
+required before a corrective activation handoff.
+
 A selective drain interrupts the original runs and creates bounded conversation
 retries. It does not preserve the executor, adopt active legacy CLI output, or
 prove that earlier tool effects will not repeat. Compatible retries resume the

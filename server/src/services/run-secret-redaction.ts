@@ -92,6 +92,8 @@ export function createRunSecretRedactionRegistry(db: Db) {
   }
 
   return {
+    /** Internal worker bootstrap only; never persist or expose plaintext values. */
+    resolveValuesForRun: valuesForRun,
     register: async (companyId: string, runId: string, value: string) => {
       const fingerprintSha256 = createHash("sha256").update(value).digest("hex");
       await db.transaction(async (tx) => {

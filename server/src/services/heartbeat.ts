@@ -1,3 +1,5 @@
+import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import { executeSupervisedLegacyAdapter, LegacyAdapterControllerDetachedError } from "./legacy-adapter-execution.js";
 import { publicChatTaskUrl } from "./chat-task-url.js";
 import { toolActionDeliveryService } from "./tool-action-delivery.js";
 import { githubBotConnectionIdsForRun } from "./chat-github-tools.js";
@@ -310,6 +312,7 @@ import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService, type MissingRuntimeBinding } from "./secrets.js";
 import {
   resolveDefaultAgentWorkspaceDir,
+  resolvePaperclipInstanceRoot,
   resolveManagedProjectWorkspaceDir,
 } from "../home-paths.js";
 import {
@@ -9234,6 +9237,8 @@ export interface HeartbeatServiceOptions {
   pluginWorkerManager?: PluginWorkerManager;
   environmentRuntime?: HeartbeatEnvironmentRuntime;
   runtimeEnv?: Record<string, string | undefined>;
+  /** Disposable-instance test seam; production uses its configured instance root. */
+  legacyAdapterWorkerInstanceRoot?: string;
   /**
    * Provider-boundary seam for persisted native-run recovery tests. Keeping
    * the seam here exercises the production reaper, claim, execution, package
@@ -12758,8 +12763,9 @@ export function heartbeatService(
     runId: string,
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+    controllerBootFence?: string,
   ) {
-    return setRunStatusFromLive(runId, status, ["running"], patch);
+    return setRunStatusFromLive(runId, status, ["running"], patch, controllerBootFence);
   }
 
   // Move a run to a new status only when its current status is one of
@@ -12772,6 +12778,7 @@ export function heartbeatService(
     status: string,
     fromStatuses: string[],
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+    controllerBootFence?: string,
   ) {
     // fromStatuses can name a terminal status as its own source (for example,
     // an idempotent "still failed" patch), so the write below is not always a
@@ -12813,6 +12820,7 @@ export function heartbeatService(
             status,
             patch,
             fromStatuses,
+            controllerBootFence,
           })
         : await db
             .update(heartbeatRuns)
@@ -12826,6 +12834,8 @@ export function heartbeatService(
               and(
                 eq(heartbeatRuns.id, runId),
                 inArray(heartbeatRuns.status, fromStatuses),
+                ...(controllerBootFence ? [eq(heartbeatRuns.controllerBootId, controllerBootFence),
+                  sql`${heartbeatRuns.controllerLeaseExpiresAt} > clock_timestamp()`] : []),
                 ...(isHeartbeatRunTerminalStatus(status)
                   ? [nativeRunnerOwnershipNotHeldCondition()]
                   : []),
@@ -19968,6 +19978,8 @@ export function heartbeatService(
     }
 
     let legacyAdapterEntered = false;
+    let supervisedLegacyExecution = false;
+    let legacyControllerDetached = false;
     let run = await getRun(runId);
     if (!run) return;
     if (run.status !== "queued" && run.status !== "running") return;
@@ -24294,9 +24306,9 @@ export function heartbeatService(
             }
             const guardedDispatch =
               await dispatchResolvedInteractionContinuationWithAtomicGate(
-                (markDispatchStarted) => {
+                async (markDispatchStarted) => {
                   legacyAdapterEntered = true;
-                  return adapter.execute({
+                  const adapterExecutionContext: AdapterExecutionContext = {
                     runId: run.id,
                     agent,
                     runtime: runtimeForAdapter,
@@ -24369,7 +24381,27 @@ export function heartbeatService(
                       });
                     },
                     authToken: authToken ?? undefined,
-                  });
+                  };
+                  if (runtimeEnv.PAPERCLIP_ENABLE_LEGACY_SUPERVISION === "1" &&
+                      agent.adapterType === "codex_local" && runtimeConfig.engine === "cli" &&
+                      !remoteExecution && executionTarget?.kind !== "remote") {
+                    supervisedLegacyExecution = true;
+                    return executeSupervisedLegacyAdapter({
+                      db, instanceRoot: options.legacyAdapterWorkerInstanceRoot ?? resolvePaperclipInstanceRoot(), context: adapterExecutionContext,
+                      secretValues: await createRunSecretRedactionRegistry(db).resolveValuesForRun(run.companyId, run.id),
+                      assertOwned: () => controllerLease.assertOwned("dispatching"),
+                      cancellationRequested: async () => {
+                        const latest = await getRun(run.id);
+                        return latest?.status === "cancelled" ||
+                          parseObject(latest?.resultJson?.executionCancellation).state === "requested";
+                      },
+                      project: event => ({ eventType: "legacy_adapter_worker", stream: "system",
+                        payload: boundHeartbeatRunEventPayloadForStorage(redactCurrentUserValue(
+                          redactEventPayload(event) ?? {}, currentUserRedactionOptions,
+                        )) }),
+                    });
+                  }
+                  return adapter.execute(adapterExecutionContext);
                 },
               );
             if (!guardedDispatch.dispatched) return;
@@ -24418,6 +24450,10 @@ export function heartbeatService(
             }
           }
         } catch (adapterErr) {
+          if (adapterErr instanceof LegacyAdapterControllerDetachedError) {
+            legacyControllerDetached = true;
+            throw adapterErr;
+          }
           if (adapterErr instanceof NativeControllerDetachedForRestartError) {
             // Preserve the provider and its run for the new controller. This
             // also keeps generic teardown from terminalizing/releasing its lease.
@@ -24872,6 +24908,7 @@ export function heartbeatService(
           run.id,
           status,
           finalRunPatch,
+          supervisedLegacyExecution ? legacyControllerBootId : undefined,
         );
         let persistedRun: typeof heartbeatRuns.$inferSelect | null =
           persistedRunWrite.run;
@@ -24887,7 +24924,7 @@ export function heartbeatService(
           // likewise keeps the provider session, logs, and usage after Stop wins.
           if (
             (adapterResult.nativeFinalization ||
-              (processCancellation && !processCancellation.failed && status === "cancelled")) &&
+              ((processCancellation || supervisedLegacyExecution) && !processCancellation?.failed && status === "cancelled")) &&
             persistedRunWrite.run?.status === status
           ) {
             persistedRun = await db
@@ -24902,12 +24939,15 @@ export function heartbeatService(
                 and(
                   eq(heartbeatRuns.id, run.id),
                   eq(heartbeatRuns.status, status),
+                  ...(supervisedLegacyExecution ? [eq(heartbeatRuns.controllerBootId, legacyControllerBootId),
+                    sql`${heartbeatRuns.controllerLeaseExpiresAt} > clock_timestamp()`] : []),
                 ),
               )
               .returning()
               .then((rows) => rows[0] ?? null);
           }
           if (!persistedRun) {
+            if (supervisedLegacyExecution && persistedRunWrite.run?.status === "running") legacyControllerDetached = true;
             logger.info(
               {
                 runId: run.id,
@@ -25280,6 +25320,10 @@ export function heartbeatService(
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
       } catch (err) {
+        if (err instanceof LegacyAdapterControllerDetachedError) {
+          legacyControllerDetached = true;
+          return;
+        }
         if (err instanceof NativeControllerDetachedForRestartError) {
           nativeSessionResumeScheduled = true;
           return;
@@ -25875,7 +25919,7 @@ export function heartbeatService(
         if (
           providerTraceCapture &&
           !providerTraceFinalized &&
-          !nativeSessionResumeScheduled
+          !nativeSessionResumeScheduled && !legacyControllerDetached
         ) {
           try {
             await traceStore.finalize(run.id, run.companyId);
@@ -25893,7 +25937,7 @@ export function heartbeatService(
         // released, so the UI never shows a finished task as "Live".
         if (
           latestRun &&
-          !nativeSessionResumeScheduled &&
+          !nativeSessionResumeScheduled && !legacyControllerDetached &&
           !nativeWorkspaceFinalizeScheduled &&
           !nativeOwnershipHeld
         ) {
@@ -25919,7 +25963,7 @@ export function heartbeatService(
             latestRun?.status,
           );
         if (
-          !nativeSessionResumeScheduled &&
+          !nativeSessionResumeScheduled && !legacyControllerDetached &&
           !nativeWorkspaceFinalizeScheduled &&
           !nativeOwnershipHeld
         ) {
@@ -26047,7 +26091,7 @@ export function heartbeatService(
         });
       }
       if (
-        !nativeSessionResumeScheduled &&
+        !nativeSessionResumeScheduled && !legacyControllerDetached &&
         !nativeWorkspaceFinalizeScheduled &&
         !shutdownInProgress
       ) {

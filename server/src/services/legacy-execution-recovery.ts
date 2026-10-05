@@ -55,6 +55,8 @@ export async function terminalizeLegacyExecution(input: {
   status: string;
   patch?: Partial<typeof heartbeatRuns.$inferInsert>;
   fromStatuses?: string[];
+  /** Optional source-controller fence for supervised worker completion. */
+  controllerBootFence?: string;
 }) {
   const { db, run, status, patch } = input;
   const issueId =
@@ -88,6 +90,8 @@ export async function terminalizeLegacyExecution(input: {
           eq(heartbeatRuns.id, run.id),
           eq(heartbeatRuns.companyId, run.companyId),
           inArray(heartbeatRuns.status, input.fromStatuses ?? [run.status]),
+          ...(input.controllerBootFence ? [eq(heartbeatRuns.controllerBootId, input.controllerBootFence),
+            sql`${heartbeatRuns.controllerLeaseExpiresAt} > clock_timestamp()`] : []),
         ),
       )
       .returning();

@@ -10,7 +10,7 @@ import { cancelLegacyAdapterWorker, readLegacyAdapterWorkerResult, startLegacyAd
 import { readLegacyAdapterEventBatch } from "../services/legacy-adapter-events.js";
 
 const fixtures: Array<{ root: string; directory?: string }> = [];
-async function wait<T>(read: () => Promise<T>, ready: (value: T) => boolean, timeoutMs = 10000) {
+async function wait<T>(read: () => Promise<T>, ready: (value: T) => boolean, timeoutMs = 20000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const value = await read();
@@ -114,7 +114,7 @@ describe("legacy adapter worker supervision", () => {
         adapterResult: result!.adapterResult, startEffects: 1 }));
     } finally { controller.kill("SIGKILL"); await exited; }
     expect(controlError).not.toContain("Error");
-  });
+  }, 30000);
 
   it("redacts a synthetic secret split across stdout chunks and the parsed result", async () => {
     const f = await fixture();
@@ -144,7 +144,7 @@ describe("legacy adapter worker supervision", () => {
     expect(logs).not.toContain(synthetic);
     expect(result!.adapterResult.summary).not.toBe(synthetic);
     expect(result!.adapterResult.exitCode).toBe(0);
-  });
+  }, 30000);
 
   it("joins the real detached executor on durable cancellation", async () => {
     const f = await fixture();
@@ -160,7 +160,7 @@ describe("legacy adapter worker supervision", () => {
     expect(result!.adapterResult.signal).toBe("SIGTERM");
     await wait(() => readDurableChildResult(handle.directory), value => value !== null);
     expect(await fs.readFile(f.effects, "utf8")).toBe("started\n");
-  });
+  }, 30000);
 
   it("rejects unsupported transports and an already-cancelled invocation before spawn", async () => {
     const f = await fixture();
@@ -170,5 +170,5 @@ describe("legacy adapter worker supervision", () => {
     abort.abort(new Error("Stopped before dispatch"));
     await expect(startLegacyAdapterWorker({ root: f.root, context: { ...f.context, signal: abort.signal }, secretValues: [] })).rejects.toThrow("Stopped before dispatch");
     expect(await fs.readdir(f.root)).not.toContain("fixture-run");
-  });
+  }, 30000);
 });

@@ -33,9 +33,20 @@ function parseEvent(bytes: Buffer): LegacyAdapterWorkerEvent {
       }
       break;
     }
-    case "meta": if (!record(value.meta)) throw new Error("Invalid adapter worker metadata"); break;
-    case "event": if (!record(value.event)) throw new Error("Invalid adapter worker runtime event"); break;
-    case "progress": if (!record(value.progress)) throw new Error("Invalid adapter worker progress"); break;
+    case "meta":
+      if (!record(value.meta) || typeof value.meta.adapterType !== "string" || typeof value.meta.command !== "string") {
+        throw new Error("Invalid adapter worker metadata");
+      }
+      break;
+    case "event":
+      if (!record(value.event) || typeof value.event.eventType !== "string") throw new Error("Invalid adapter worker runtime event");
+      break;
+    case "progress":
+      if (!record(value.progress) || typeof value.progress.message !== "string" ||
+          !["git_sync", "config_sync", "adapter_startup", "restore", "export", "finalize"].includes(String(value.progress.phase))) {
+        throw new Error("Invalid adapter worker progress");
+      }
+      break;
     default: throw new Error("Unknown adapter worker event");
   }
   return value as LegacyAdapterWorkerEvent;

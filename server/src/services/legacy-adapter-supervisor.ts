@@ -37,6 +37,11 @@ export async function startLegacyAdapterWorker(input: {
     throw new Error("Legacy adapter transport cannot be supervised");
   }
   const mcpServers = context.runtimeMcp?.getServers() ?? [];
+  const configuredEnv = context.config.env;
+  const configuredSecrets = configuredEnv && typeof configuredEnv === "object" && !Array.isArray(configuredEnv)
+    ? Object.entries(configuredEnv).flatMap(([key, value]) =>
+      /(?:TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY|CREDENTIAL)/i.test(key) && typeof value === "string" ? [value] : [])
+    : [];
   const workerInput: LegacyAdapterWorkerInput = {
     runId: context.runId, agent: context.agent, runtime: context.runtime,
     config: context.config, context: context.context,
@@ -47,6 +52,7 @@ export async function startLegacyAdapterWorker(input: {
     mcpServers,
     secretValues: [...new Set([
       ...input.secretValues, context.authToken ?? "", context.runtimeTools?.bearerToken ?? "",
+      ...configuredSecrets,
       ...mcpServers.map(server => server.token),
     ])].filter(value => typeof value === "string" && value.length > 0),
   };

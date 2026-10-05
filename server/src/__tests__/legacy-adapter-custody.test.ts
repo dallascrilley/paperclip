@@ -6,6 +6,7 @@ import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.j
 import { reserveLegacyAdapterCustody, commitLegacyAdapterEvents } from "../services/legacy-adapter-custody.js";
 import { legacyControllerBootId } from "../services/legacy-controller-lease.js";
 import type { LegacyAdapterWorkerEvent } from "../services/legacy-adapter-events.js";
+import { terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
 
 describe("legacy transport database custody", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -80,5 +81,17 @@ describe("legacy transport database custody", () => {
     } })).rejects.toThrow("lease expired during ingestion");
     expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.runId))).toHaveLength(0);
     expect((await db.select().from(legacyAdapterTransports).where(eq(legacyAdapterTransports.runId, f.runId)))[0].eventCursor).toBe(0);
+  });
+
+  it("fences common legacy terminalization against stale or expired controllers", async () => {
+    const f = await fixture();
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const input = { db, run, status: "failed", fromStatuses: ["running"] };
+    expect(await terminalizeLegacyExecution({ ...input, controllerBootFence: randomUUID() })).toBeNull();
+    await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: sql`clock_timestamp() - interval '1 second'` }).where(eq(heartbeatRuns.id, f.runId));
+    expect(await terminalizeLegacyExecution({ ...input, controllerBootFence: legacyControllerBootId })).toBeNull();
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0].status).toBe("running");
+    await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: sql`clock_timestamp() + interval '60 seconds'` }).where(eq(heartbeatRuns.id, f.runId));
+    expect(await terminalizeLegacyExecution({ ...input, controllerBootFence: legacyControllerBootId })).toMatchObject({ status: "failed" });
   });
 });
