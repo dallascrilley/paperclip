@@ -248,7 +248,35 @@ at least one identity source. Supported-platform process probes fail explicitly
 instead of silently treating a live PID as either the original owner or a
 recycled process when identity cannot be established.
 
-Use `--drain-required` only when the deploy intentionally requires the old terminate-and-retry behavior. Without that flag, the old server verifies that the marker targets its own PID, stops new scheduler work, waits for any queue-claim callback already in flight, snapshots currently running heartbeat run IDs and child PIDs, and skips the shutdown drain so eligible detached local-agent processes can keep running. ACP-backed local runs use server-owned stdio and cannot survive their parent server, so the old server instead persists their complete snapshot, changes the marker to `drainRequired` with `drainReason: "active_acp_run"`, and drains only those runs to bounded conversation retries. These retries resume the prior session when compatible, otherwise carry the full task conversation into a fresh session. They do not automatically replay tool calls or require receipts for every prior action. Detached CLI runs remain eligible for adoption during the same mixed restart. If an ACP process terminates but its terminal run update does not persist, startup classifies it as lost with reason `selective_drain_not_finalized` rather than treating the drain as successful. On startup the new server writes `$PAPERCLIP_HOME/instances/${PAPERCLIP_INSTANCE_ID:-default}/hot-restart-report.json` with `previousServerPid`, `newServerPid`, `previousServerVersion`, `newServerVersion`, `drainReason`, `adoptedRunIds`, `finalizedWhileDownRunIds`, `lostRunIds`, and per-run classifications before the normal orphan reaper runs.
+Without `--drain-required`, the server verifies the target PID, stops scheduler
+work, waits for queue claims, and captures active run identities. Recognized
+legacy local adapters still own controller-bound stdout/stderr pipes and
+terminal-result parsers, even when their process groups are detached. The server
+requires a selective drain for these CLI runs (`active_legacy_pipe_run`) and for
+server-stdio ACP runs (`active_acp_run`). A mixed ACP/CLI restart drains both sets.
+Native Runner recovery retains its separate ownership path.
+
+A selective drain interrupts the original runs and creates bounded conversation
+retries. It does not preserve the executor, adopt active legacy CLI output, or
+prove that earlier tool effects will not repeat. Compatible retries resume the
+prior session. Other retries carry the task conversation into a fresh session.
+If a drained run still has a running database row, startup reports it as lost
+with reason `selective_drain_not_finalized`. Later cleanup is not evidence of
+successful prior finalization.
+
+For a quiescent legacy rollout, pause new dispatch through the supported operator
+controls, let active local runs complete, and confirm terminal rows before the
+restart. This avoids the severed-pipe boundary but does not meet an active-run
+preservation requirement. The shutdown guard requires the patched outgoing
+server. Installing a new binary does not change an already-running old server's
+pipes or shutdown behavior.
+
+On startup the replacement writes
+`$PAPERCLIP_HOME/instances/${PAPERCLIP_INSTANCE_ID:-default}/hot-restart-report.json`
+with controller versions/PIDs, drain reason, and genuine per-run classifications.
+PID liveness alone cannot prove recovered output or terminal-result ownership.
+Existing old-version snapshots still use the legacy PID adoption path. Do not
+use those receipts as active transport acceptance.
 
 When Paperclip manages embedded PostgreSQL, it suppresses that dependency's eager
 `SIGINT`/`SIGTERM` cleanup hooks. Paperclip owns signal ordering so the heartbeat

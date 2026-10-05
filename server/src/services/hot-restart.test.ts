@@ -89,6 +89,21 @@ describe("hot-restart path compatibility", () => {
     ).not.toBeNull();
   });
 
+  it("retains the legacy pipe drain reason and exact affected run IDs", () => {
+    expect(parseHotRestartIntent({
+      version: 1,
+      requestedAt: "2026-10-05T14:00:00.000Z",
+      previousServerPid: 123,
+      drainRequired: true,
+      drainReason: "active_legacy_pipe_run",
+      drainRunIds: ["cli-run", "acp-run", "cli-run"],
+    })).toMatchObject({
+      drainRequired: true,
+      drainReason: "active_legacy_pipe_run",
+      drainRunIds: ["cli-run", "acp-run"],
+    });
+  });
+
   it("reads Linux process start time from proc metadata", async () => {
     await expect(
       readProcessStartedAt(123, {

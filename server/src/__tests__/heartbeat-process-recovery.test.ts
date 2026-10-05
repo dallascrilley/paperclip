@@ -2817,7 +2817,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
-  it("captures a hot-restart shutdown snapshot without interrupting running runs", async () => {
+  it("snapshots detached CLI runs for drain without claiming transport adoption", async () => {
     const child = spawnAliveProcess();
     childProcesses.add(child);
     expect(child.pid).toBeGreaterThan(0);
@@ -2846,9 +2846,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       );
 
       expect(result).toEqual({
-        mode: "hot_restart",
-        skipDrain: true,
+        mode: "legacy_pipe_drain_required",
+        skipDrain: false,
         activeRunIds: [runId],
+        activeAcpRunIds: [],
+        drainRunIds: [runId],
+        drainReason: "active_legacy_pipe_run",
       });
       expect(mockCloseIdleWarmNativeSessionsForRestart).toHaveBeenCalledOnce();
       expect(isPidAlive(child.pid)).toBe(true);
@@ -3032,7 +3035,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
-  it("drains only server-stdio runs and preserves detached CLI adoption in a mixed restart", async () => {
+  it("drains server-stdio and detached CLI runs before a mixed restart", async () => {
     const acpChild = spawnAliveProcess();
     const cliChild = spawnAliveProcess();
     childProcesses.add(acpChild);
@@ -3073,15 +3076,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         new Date("2026-08-04T01:06:00.000Z"),
       );
       expect(preparation).toMatchObject({
-        mode: "acp_drain_required",
+        mode: "legacy_pipe_drain_required",
         skipDrain: false,
         activeAcpRunIds: [acp.runId],
-        drainRunIds: [acp.runId],
-        drainReason: "active_acp_run",
+        drainRunIds: [acp.runId, cli.runId],
+        drainReason: "active_legacy_pipe_run",
       });
-      if (preparation.mode !== "acp_drain_required") {
+      if (preparation.mode !== "legacy_pipe_drain_required") {
         throw new Error(
-          `Expected selective ACP drain, received ${preparation.mode}`,
+          `Expected selective transport drain, received ${preparation.mode}`,
         );
       }
       expect(new Set(preparation.activeRunIds)).toEqual(
@@ -3093,17 +3096,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         new Date("2026-08-04T01:06:01.000Z"),
         preparation.drainRunIds,
       );
-      expect(drain.interruptedRunIds).toEqual([acp.runId]);
+      expect(new Set(drain.interruptedRunIds)).toEqual(new Set([acp.runId, cli.runId]));
       await waitForPidExit(acpChild.pid!);
-      expect(isPidAlive(cliChild.pid)).toBe(true);
+      await waitForPidExit(cliChild.pid!);
 
       const reconciliation = await heartbeat.reconcileHotRestartAdoption(
         new Date("2026-08-04T01:07:00.000Z"),
       );
       expect(reconciliation).toMatchObject({
         mode: "reported",
-        adoptedRunIds: [cli.runId],
-        finalizedWhileDownRunIds: [acp.runId],
+        adoptedRunIds: [],
+        finalizedWhileDownRunIds: expect.arrayContaining([acp.runId, cli.runId]),
         lostRunIds: [],
         skippedRunIds: [],
       });
@@ -3117,7 +3120,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         errorCode: "server_shutdown_interrupted",
       });
       expect(originalRuns.find((run) => run.id === cli.runId)).toMatchObject({
-        status: "running",
+        status: "interrupted",
+        errorCode: "server_shutdown_interrupted",
       });
 
       const report = JSON.parse(
@@ -3125,9 +3129,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       ) as Record<string, unknown>;
       expect(report).toMatchObject({
         drainRequired: true,
-        drainReason: "active_acp_run",
-        adoptedRunIds: [cli.runId],
-        finalizedWhileDownRunIds: [acp.runId],
+        drainReason: "active_legacy_pipe_run",
+        adoptedRunIds: [],
+        finalizedWhileDownRunIds: expect.arrayContaining([acp.runId, cli.runId]),
         lostRunIds: [],
       });
     });
@@ -3290,137 +3294,142 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
-  it("persists codex_local spawn identity before hot restart and never loses the live run for missing metadata", async () => {
-    let releaseAdapter: (() => void) | null = null;
-    let spawnedPid: number | null = null;
-    const adapterStarted = new Promise<void>((resolve) => {
-      mockAdapterExecute.mockImplementationOnce(async (rawInput?: unknown) => {
-        const input = rawInput as {
-          onSpawn?: (meta: {
-            pid: number;
-            processGroupId: number | null;
-            startedAt: string;
-          }) => Promise<void>;
-        };
-        const child = spawnAliveProcess();
-        childProcesses.add(child);
-        if (!child.pid)
-          throw new Error("Test codex_local child did not expose a pid");
-        spawnedPid = child.pid;
-        await input.onSpawn?.({
-          pid: child.pid,
-          processGroupId: null,
-          startedAt: new Date("2026-07-30T07:00:00.000Z").toISOString(),
-        });
-        resolve();
-        await new Promise<void>((release) => {
-          releaseAdapter = release;
-        });
-        return {
-          exitCode: 0,
-          signal: null,
-          timedOut: false,
-          errorMessage: null,
-          summary: "Codex run completed after hot restart adoption.",
-          provider: "test",
-          model: "test-model",
-        };
-      });
-    });
-    const { runId } = await seedRunFixture({
-      adapterType: "codex_local",
-      agentStatus: "idle",
-      runStatus: "queued",
-      processPid: null,
-      processGroupId: null,
-      contextSnapshot: {
-        executionEngine: "cli",
-        processTopology: "detached",
-      },
-      includeIssue: false,
-    });
-    const heartbeat = heartbeatService(db);
-    await heartbeat.resumeQueuedRuns();
-    await Promise.race([
-      adapterStarted,
-      new Promise<never>((_, reject) => {
-        setTimeout(
-          () =>
-            reject(
-              new Error("Timed out waiting for codex_local spawn identity"),
-            ),
-          3_000,
-        );
-      }),
-    ]);
-
-    const running = await waitForValue(async () =>
-      db
-        .select()
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, runId))
-        .then((rows) => {
-          const row = rows[0] ?? null;
-          return row?.status === "running" && row.processPid ? row : null;
-        }),
-    );
-    const observedProcessStartedAt = await readProcessStartedAt(spawnedPid!);
-    expect(observedProcessStartedAt).not.toBeNull();
-    expect(running).toMatchObject({
-      id: runId,
-      status: "running",
-      processPid: spawnedPid,
-      processGroupId: null,
-      processStartedAt: new Date(observedProcessStartedAt!),
-    });
-
+  it("persists codex_local spawn identity and reports an undrained pipe run as lost", async () => {
     await withTempPaperclipHome(async (home) => {
-      await writeHotRestartIntent({
-        previousServerPid: process.pid,
-        previousServerVersion: "old-version",
-        requestedAt: new Date("2026-07-30T07:01:00.000Z"),
+      let releaseAdapter: (() => void) | null = null;
+      let spawnedPid: number | null = null;
+      const adapterStarted = new Promise<void>((resolve) => {
+        mockAdapterExecute.mockImplementationOnce(async (rawInput?: unknown) => {
+          const input = rawInput as {
+            onSpawn?: (meta: {
+              pid: number;
+              processGroupId: number | null;
+              startedAt: string;
+            }) => Promise<void>;
+          };
+          const child = spawnAliveProcess();
+          childProcesses.add(child);
+          if (!child.pid)
+            throw new Error("Test codex_local child did not expose a pid");
+          spawnedPid = child.pid;
+          await input.onSpawn?.({
+            pid: child.pid,
+            processGroupId: null,
+            startedAt: new Date("2026-07-30T07:00:00.000Z").toISOString(),
+          });
+          resolve();
+          await new Promise<void>((release) => {
+            releaseAdapter = release;
+          });
+          return {
+            exitCode: 0,
+            signal: null,
+            timedOut: false,
+            errorMessage: null,
+            summary: "Codex run completed in its original controller.",
+            provider: "test",
+            model: "test-model",
+          };
+        });
       });
-      await heartbeat.prepareHotRestartShutdown(
-        "SIGTERM",
-        new Date("2026-07-30T07:02:00.000Z"),
-      );
+      const { runId, agentId } = await seedRunFixture({
+        adapterType: "codex_local",
+        agentStatus: "idle",
+        runStatus: "queued",
+        processPid: null,
+        processGroupId: null,
+        contextSnapshot: {
+          executionEngine: "cli",
+          processTopology: "detached",
+        },
+        includeIssue: false,
+      });
+      await db.update(agents).set({ adapterConfig: { cwd: home, engine: "cli" } }).where(eq(agents.id, agentId));
+      const heartbeat = heartbeatService(db, { runtimeEnv: {} });
+      await heartbeat.resumeQueuedRuns();
+      await Promise.race([
+        adapterStarted,
+        new Promise<never>((_, reject) => {
+          setTimeout(
+            async () => {
+              const current = await heartbeat.getRun(runId);
+              reject(new Error(`Timed out waiting for codex_local spawn identity: ${JSON.stringify({
+                status: current?.status, errorCode: current?.errorCode, error: current?.error,
+              })}`));
+            },
+            3_000,
+          );
+        }),
+      ]);
 
-      const adoption = await heartbeat.reconcileHotRestartAdoption(
-        new Date("2026-07-30T07:03:00.000Z"),
+      const running = await waitForValue(async () =>
+        db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId))
+          .then((rows) => {
+            const row = rows[0] ?? null;
+            return row?.status === "running" && row.processPid ? row : null;
+          }),
       );
-      expect(adoption).toMatchObject({
-        mode: "reported",
-        adoptedRunIds: [runId],
-        finalizedWhileDownRunIds: [],
-        lostRunIds: [],
+      const observedProcessStartedAt = await readProcessStartedAt(spawnedPid!);
+      expect(observedProcessStartedAt).not.toBeNull();
+      expect(running).toMatchObject({
+        id: runId,
+        status: "running",
+        processPid: spawnedPid,
+        processGroupId: null,
+        processStartedAt: new Date(observedProcessStartedAt!),
       });
-      const report = JSON.parse(
-        await fs.readFile(resolveHotRestartReportPath(home), "utf8"),
-      ) as { runs?: Array<Record<string, unknown>> };
-      expect(report.runs).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            runId,
-            classification: "adopted",
-            reason: "process_pid_alive",
-          }),
-        ]),
-      );
-      expect(report.runs).not.toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            runId,
-            reason: "missing_process_metadata",
-          }),
-        ]),
-      );
+
+      {
+        await writeHotRestartIntent({
+          previousServerPid: process.pid,
+          previousServerVersion: "old-version",
+          requestedAt: new Date("2026-07-30T07:01:00.000Z"),
+        });
+        await heartbeat.prepareHotRestartShutdown(
+          "SIGTERM",
+          new Date("2026-07-30T07:02:00.000Z"),
+        );
+
+        const adoption = await heartbeat.reconcileHotRestartAdoption(
+          new Date("2026-07-30T07:03:00.000Z"),
+        );
+        expect(adoption).toMatchObject({
+          mode: "reported",
+          adoptedRunIds: [],
+          finalizedWhileDownRunIds: [],
+          lostRunIds: [runId],
+        });
+        const report = JSON.parse(
+          await fs.readFile(resolveHotRestartReportPath(home), "utf8"),
+        ) as { runs?: Array<Record<string, unknown>> };
+        expect(report.runs).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              runId,
+              classification: "lost",
+              reason: "selective_drain_not_finalized",
+            }),
+          ]),
+        );
+        expect(report.runs).not.toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              runId,
+              reason: "missing_process_metadata",
+            }),
+          ]),
+        );
+      }
+
+      if (!releaseAdapter)
+        throw new Error("Adapter release handle was not captured");
+      releaseAdapter();
+      const settled = await waitForRunToSettle(heartbeat, runId, 5_000);
+      expect(settled?.status).toBe("succeeded");
     });
-
-    if (!releaseAdapter)
-      throw new Error("Adapter release handle was not captured");
-    releaseAdapter();
-    const settled = await waitForRunToSettle(heartbeat, runId, 5_000);
-    expect(settled?.status).toBe("succeeded");
   });
 
   it("reports adopted hot-restart runs before startup reap can mark them process_lost", async () => {

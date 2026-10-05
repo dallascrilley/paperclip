@@ -14431,14 +14431,29 @@ export function heartbeatService(
     };
 
     const serverStdioRuns = activeRuns.filter(isServerStdioBoundHotRestartRun);
-    if (serverStdioRuns.length > 0) {
-      const activeServerStdioRunIds = serverStdioRuns.map(({ run }) => run.id);
+    // Detached process groups do not detach their stdout/stderr pipes or the
+    // adapter's terminal-result parser from this controller. Until those have
+    // durable ownership, every recognized legacy CLI run requires a drain.
+    const legacyPipeRuns = activeRuns.filter(
+      ({ run, adapterType }) =>
+        run.runtimeMode !== "native" &&
+        isTrackedLocalChildProcessAdapter(adapterType) &&
+        !serverStdioRuns.some((input) => input.run.id === run.id),
+    );
+    const drainRunIds = [
+      ...serverStdioRuns.map(({ run }) => run.id),
+      ...legacyPipeRuns.map(({ run }) => run.id),
+    ];
+    if (drainRunIds.length > 0) {
+      const drainReason = legacyPipeRuns.length > 0
+        ? "active_legacy_pipe_run" as const
+        : "active_acp_run" as const;
       await writeHotRestartShutdownSnapshot({
         intent: intentWithVersion,
         signal,
         activeRuns: snapshotRuns,
-        drainReason: "active_acp_run",
-        drainRunIds: activeServerStdioRunIds,
+        drainReason,
+        drainRunIds,
         capturedAt: now,
       });
 
@@ -14447,19 +14462,21 @@ export function heartbeatService(
           signal,
           previousServerPid: intent.previousServerPid,
           activeRunIds: snapshotRuns.map((run) => run.runId),
-          activeServerStdioRunIds,
-          drainReason: "active_acp_run",
+          drainRunIds,
+          drainReason,
         },
-        "server-stdio agent run prevents hot-restart adoption; using graceful drain and retry",
+        "controller-owned agent transport prevents hot-restart adoption; using graceful drain and retry",
       );
 
       return {
-        mode: "acp_drain_required" as const,
+        mode: legacyPipeRuns.length > 0
+          ? "legacy_pipe_drain_required" as const
+          : "acp_drain_required" as const,
         skipDrain: false as const,
         activeRunIds: snapshotRuns.map((run) => run.runId),
-        activeAcpRunIds: activeServerStdioRunIds,
-        drainRunIds: activeServerStdioRunIds,
-        drainReason: "active_acp_run" as const,
+        activeAcpRunIds: serverStdioRuns.map(({ run }) => run.id),
+        drainRunIds,
+        drainReason,
       };
     }
 
@@ -14654,21 +14671,22 @@ export function heartbeatService(
         continue;
       }
 
-      const hasSelectiveAcpDrain =
-        intent.drainReason === "active_acp_run" &&
+      const hasSelectiveTransportDrain =
+        (intent.drainReason === "active_acp_run" ||
+          intent.drainReason === "active_legacy_pipe_run") &&
         (intent.drainRunIds?.length ?? 0) > 0;
       if (
-        hasSelectiveAcpDrain &&
+        hasSelectiveTransportDrain &&
         intent.drainRunIds?.includes(candidate.runId)
       ) {
-        // A selective ACP drain is expected to persist a terminal row before
+        // A selective transport drain must persist a terminal row before
         // the new server starts. If the process was terminated but that write
         // failed, surface the run as lost instead of hiding it as an expected
         // drain skip.
         classify(candidate, "lost", "selective_drain_not_finalized", patch);
         continue;
       }
-      if (intent.drainRequired && !hasSelectiveAcpDrain) {
+      if (intent.drainRequired && !hasSelectiveTransportDrain) {
         classify(candidate, "skipped", "drain_required", patch);
         continue;
       }
