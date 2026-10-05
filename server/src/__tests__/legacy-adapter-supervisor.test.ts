@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { readDurableChildOutput, readDurableChildResult } from "@paperclipai/adapter-utils/durable-child-process";
 import { cancelLegacyAdapterWorker, readLegacyAdapterWorkerResult, startLegacyAdapterWorker } from "../services/legacy-adapter-supervisor.js";
+import { readLegacyAdapterEventBatch } from "../services/legacy-adapter-events.js";
 
 const fixtures: Array<{ root: string; directory?: string }> = [];
 async function wait<T>(read: () => Promise<T>, ready: (value: T) => boolean, timeoutMs = 10000) {
@@ -87,21 +88,29 @@ describe("legacy adapter worker supervision", () => {
       const handle = JSON.parse(controlOutput.trim());
       f.owned.directory = handle.directory;
       const before = await wait(() => readDurableChildOutput(handle.directory, "stdout"), value => value.bytes.toString().includes('"kind":"spawn"'));
+      const binding = { runId: f.context.runId, companyId: f.context.agent.companyId, adapterType: "codex_local" };
+      const framedBefore = await readLegacyAdapterEventBatch({ directory: handle.directory, binding, cursor: 0 });
       const event = before.bytes.toString().split("\n").map(line => { try { return JSON.parse(line); } catch { return null; } }).find(value => value?.kind === "spawn");
       expect(event.meta.pid).toBeGreaterThan(0);
       controller.kill("SIGKILL");
       await exited;
       process.kill(event.meta.pid, 0);
-      const binding = { runId: f.context.runId, companyId: f.context.agent.companyId, adapterType: "codex_local" };
       const result = await wait(() => readLegacyAdapterWorkerResult(handle.directory, binding), value => value !== null);
       expect(result!.adapterResult).toMatchObject({ exitCode: 0, signal: null, timedOut: false, summary: "fixture completed", usage: { inputTokens: 3, cachedInputTokens: 0, outputTokens: 5 }, sessionId: "fixture-session" });
       const later = await readDurableChildOutput(handle.directory, "stdout", before.offset);
       expect(later.bytes.toString()).toContain("turn.completed");
+      const framedAfter = await wait(() => readLegacyAdapterEventBatch({
+        directory: handle.directory, binding, cursor: framedBefore.nextCursor,
+      }), value => value.terminal !== null);
+      expect(framedAfter.terminal).toEqual(result);
+      expect(framedAfter.events.some(value => value.kind === "log" && value.chunk.includes("turn.completed"))).toBe(true);
       expect(await fs.readFile(f.effects, "utf8")).toBe("started\n");
       await expect(readLegacyAdapterWorkerResult(handle.directory, { ...binding, companyId: "other-company" })).rejects.toThrow("binding mismatch");
       console.info("legacy-adapter-worker-proof", JSON.stringify({ adapterType: "codex_local", mode,
         previousControllerPid: controller.pid, supervisorPid: handle.supervisorPid,
         executor: event.meta, beforeOffset: before.offset, afterOffset: later.offset,
+        framedBeforeCursor: framedBefore.nextCursor, framedAfterCursor: framedAfter.nextCursor,
+        replacementConsumedEvents: framedAfter.events.length,
         adapterResult: result!.adapterResult, startEffects: 1 }));
     } finally { controller.kill("SIGKILL"); await exited; }
     expect(controlError).not.toContain("Error");
