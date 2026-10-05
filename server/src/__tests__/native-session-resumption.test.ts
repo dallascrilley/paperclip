@@ -1,7 +1,9 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { fileURLToPath } from "node:url";
+import { promises as fs, realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq, inArray } from "drizzle-orm";
 import {
@@ -633,7 +635,12 @@ describe.each(["unchanged", "newer_active", "stale_idle"] as const)(
     const newerWakeKey = `newer-comment:${newerCommentId}`;
     const turnId = "provider-active-turn";
     const providerSessionId = "provider-existing-session";
-    const repoRoot = fileURLToPath(new URL("../../../", import.meta.url));
+    // Native attachment staging writes into the execution workspace. Keep it
+    // separate from checkout metadata and other suites' staging directories.
+    const repoRoot = join(
+      realpathSync(tmpdir()),
+      `paperclip-native-recovery-${randomUUID()}`,
+    );
     const contract = {
       revision: "phase6-recovery-v1",
       objective: "Recover the persisted provider turn",
@@ -781,6 +788,8 @@ describe.each(["unchanged", "newer_active", "stale_idle"] as const)(
     };
 
     beforeAll(async () => {
+      await fs.mkdir(repoRoot, { recursive: true });
+      execFileSync("git", ["init"], { cwd: repoRoot, stdio: "ignore" });
       temporary = await startEmbeddedPostgresTestDatabase(
         "paperclip-native-reaper-e2e-",
       );
@@ -962,15 +971,19 @@ describe.each(["unchanged", "newer_active", "stale_idle"] as const)(
       ) {
         staleProviderProcess.kill("SIGKILL");
       }
-      if (temporary) {
-        await drainHeartbeatRunsToQuiescence(
-          db,
-          heartbeatService(db, {
-            runtimeEnv: { PAPERCLIP_INSTANCE_ID: "phase6-recovery-test" },
-            nativeSessionBackendFactory: () => backend,
-          }),
-        );
-        await temporary.cleanup();
+      try {
+        if (temporary) {
+          await drainHeartbeatRunsToQuiescence(
+            db,
+            heartbeatService(db, {
+              runtimeEnv: { PAPERCLIP_INSTANCE_ID: "phase6-recovery-test" },
+              nativeSessionBackendFactory: () => backend,
+            }),
+          );
+          await temporary.cleanup();
+        }
+      } finally {
+        await fs.rm(repoRoot, { recursive: true, force: true });
       }
     });
 
