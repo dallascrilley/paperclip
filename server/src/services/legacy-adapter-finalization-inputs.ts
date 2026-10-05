@@ -16,6 +16,8 @@ export const legacyAdapterFinalizationInputsSchema = z.object({
   taskKey: nullableString,
   issueId: nullableString,
   configuredModel: nullableString,
+  workspace: z.object({ executionWorkspaceId: z.string().uuid().nullable(),
+    cwd: z.string(), worktreePath: nullableString, branchName: nullableString }).strict(),
   previousSessionParams: sessionParams,
   previousSessionId: nullableString,
   previousSessionDisplayId: nullableString,

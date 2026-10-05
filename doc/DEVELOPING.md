@@ -280,8 +280,13 @@ The supported worker currently covers local `codex_local` with engine `cli`.
 Remote execution, ACP engines and other legacy adapters retain their drain gate.
 Pre-change PID-only runs cannot acquire independent pipes or prepared custody
 retroactively. They must complete before a quiescent rollout. That rollout is
-not active-adoption proof. Recovery of ancillary workspace finalization, managed
-auth-home cleanup remains under development. A Stop on the attached replacement
+not active-adoption proof. Before dispatch the host saves its workspace ID, cwd,
+worktree path and branch fallback in immutable preparation. The replacement
+reuses the original workspace finalizer, including the managed branch inspection,
+supported coherence repair and operation receipt. It validates the saved workspace
+against the company-scoped database record. Branch validation failure remains a
+failed run; it does not certify successful finalization. Managed auth-home cleanup
+remains under development. A Stop on the attached replacement
 consumer records the bound exit tail without reviving the cancelled row. Running
 event ingestion still requires a live lease; cancelled tail ingestion requires
 the same company, agent, custody, cursor and controller identity. Replacement

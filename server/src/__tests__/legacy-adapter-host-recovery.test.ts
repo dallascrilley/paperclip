@@ -3,12 +3,13 @@ import { heartbeatService } from "../services/heartbeat.js";
 import { legacyControllerBootId } from "../services/legacy-controller-lease.js";
 import { preparedFinalizationFixture } from "./legacy-adapter-finalization-inputs.fixture.js";
 import fs from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
-import { agents, companies, createDb, heartbeatRuns, heartbeatRunEvents, legacyAdapterTransports } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns, heartbeatRunEvents, legacyAdapterTransports, workspaceOperations, projects, executionWorkspaces } from "@paperclipai/db";
 import { readDurableChildResult } from "@paperclipai/adapter-utils/durable-child-process";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { reserveLegacyAdapterCustody } from "../services/legacy-adapter-custody.js";
@@ -68,16 +69,31 @@ describe("replacement legacy host finalization", () => {
     expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId))).toHaveLength(0);
   });
 
-  it.each(["sleeping", "logging", "cancelled"] as const)("finalizes the same %s Codex executor through common host session and usage projection", async mode => {
+  it.each(["sleeping", "logging", "cancelled", "branch_mismatch"] as const)("finalizes the same %s Codex executor through common host session and usage projection", async mode => {
     const runId = randomUUID(), previousBootId = randomUUID(), replacementBootId = legacyControllerBootId;
     const binding = { runId, companyId, agentId, adapterType: "codex_local" };
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "legacy",
       controllerBootId: previousBootId, controllerLeaseExpiresAt: sql`clock_timestamp() + interval '60 seconds'` });
     const preparation = { ...preparedFinalizationFixture(), taskKey: `fixture-task-${runId}`,
       previousSessionParams: null, previousSessionId: null, previousSessionDisplayId: null, taskSessionReused: false };
-    const custody = await reserveLegacyAdapterCustody(db, binding, previousBootId, preparation);
     const work = path.join(root, runId);
-    await fs.mkdir(work);
+    preparation.workspace.cwd = work;
+    if (mode === "branch_mismatch") {
+      const repo = path.join(root, `${runId}-repo`);
+      await fs.mkdir(repo);
+      const git = (args: string[], cwd = repo) => execFileSync("/usr/bin/git", args, { cwd, stdio: "pipe" });
+      git(["init", "-b", "base"]);
+      git(["-c", "user.name=Fixture", "-c", "user.email=fixture@localhost", "commit", "--allow-empty", "-m", "fixture"]);
+      git(["worktree", "add", "-b", "expected", work]);
+      git(["checkout", "-b", "wrong"], work);
+      const projectId = randomUUID(), workspaceId = randomUUID();
+      await db.insert(projects).values({ id: projectId, companyId, name: "Recovery branch fixture" });
+      await db.insert(executionWorkspaces).values({ id: workspaceId, companyId, projectId,
+        mode: "isolated_workspace", strategyType: "git_worktree", name: "Owned fixture",
+        cwd: work, providerRef: work, branchName: "expected", status: "active" });
+      preparation.workspace = { executionWorkspaceId: workspaceId, cwd: work, worktreePath: work, branchName: "expected" };
+    } else await fs.mkdir(work);
+    const custody = await reserveLegacyAdapterCustody(db, binding, previousBootId, preparation);
     const home = path.join(work, "home"), codexHome = path.join(work, "codex");
     await fs.mkdir(home); await fs.mkdir(codexHome);
     const effects = path.join(work, "effects"), release = path.join(work, "release");
@@ -149,7 +165,7 @@ describe("replacement legacy host finalization", () => {
       else await fs.writeFile(release, "");
       await heartbeat.drainActiveRunExecutions();
       const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-      expect(after).toMatchObject({ status: mode === "cancelled" ? "cancelled" : "succeeded", processPid: before.processPid, processGroupId: before.processGroupId,
+      expect(after).toMatchObject({ status: mode === "cancelled" ? "cancelled" : mode === "branch_mismatch" ? "failed" : "succeeded", processPid: before.processPid, processGroupId: before.processGroupId,
         controllerBootId: replacementBootId });
       const [tail] = await db.select().from(legacyAdapterTransports).where(eq(legacyAdapterTransports.runId, runId));
       expect(tail.eventCursor).toBeGreaterThan(previousCustody.eventCursor);
@@ -173,6 +189,12 @@ describe("replacement legacy host finalization", () => {
           resultJson: { summary: "reattached result" }, usageJson: { inputTokens: 3, outputTokens: 5 } });
         expect(log.content).toContain("turn.completed");
         expect(after.stdoutExcerpt).toContain("turn.completed");
+      }
+      const operations = await db.select().from(workspaceOperations).where(eq(workspaceOperations.heartbeatRunId, runId));
+      expect(operations.some(row => row.phase === "workspace_finalize" && row.status === (mode === "branch_mismatch" ? "failed" : "succeeded"))).toBe(true);
+      if (mode === "branch_mismatch") {
+        expect(after.errorCode).toBe("workspace_validation_failed");
+        expect(execFileSync("/usr/bin/git", ["branch", "--show-current"], { cwd: work, encoding: "utf8" }).trim()).toBe("wrong");
       }
       expect(rows.filter(row => row.eventType === "legacy_adapter_custody_claimed")).toHaveLength(1);
       // Explicit lease expiry in one process: source host finalization proof,

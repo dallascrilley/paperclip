@@ -476,3 +476,10 @@ Source sleeping/logging fixtures cover this route with explicit lease expiry and
 mocked restart-marker I/O in one process. Ancillary workspace/auth cleanup and
 cancellation boundaries remain incomplete. These checkpoints do not establish
 installed hot-restart acceptance or authorize live activation.
+
+The experimental legacy preparation also records credential-free workspace facts
+before dispatch: execution-workspace ID, cwd, worktree path and branch fallback.
+The replacement validates the saved ID against the company-scoped workspace and
+uses the same host workspace-finalize barrier as the original controller. A
+historical preparation without these required facts cannot be claimed as a
+complete recovery capability. The worker cannot supply or change these facts.
