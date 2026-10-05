@@ -1206,4 +1206,159 @@ describe("issue execution policy routes", () => {
       }),
     );
   });
+
+  describe("review-to-return-owner approval persistence", () => {
+    const executorId = "33333333-3333-4333-8333-333333333333";
+    const reviewerId = "44444444-4444-4444-8444-444444444444";
+    const strangerId = "66666666-6666-4666-8666-666666666666";
+    const issueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const agentActor = (agentId: string): TestActor => ({ type: "agent", agentId, companyId: "company-1", runId: null });
+
+    function fixture(ownerType: "agent" | "user") {
+      const owner = ownerType === "agent"
+        ? { type: "agent" as const, agentId: executorId, userId: null }
+        : { type: "user" as const, agentId: null, userId: "delivery-user" };
+      const reviewer = { type: "agent" as const, agentId: reviewerId, userId: null };
+      const policy = normalizeIssueExecutionPolicy({ stages: [
+        { type: "review", participants: [owner, reviewer] },
+        { type: "approval", participants: [owner] },
+      ] })!;
+      let persisted: any = {
+        id: issueId, companyId: "company-1", status: "in_review", identifier: "PAP-1008",
+        title: "Separate delivery approval", assigneeAgentId: reviewerId, assigneeUserId: null,
+        createdByUserId: "local-board", executionPolicy: policy,
+        executionState: { status: "pending", currentStageId: policy.stages[0].id,
+          currentStageIndex: 0, currentStageType: "review", currentParticipant: reviewer,
+          returnAssignee: owner, completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null },
+      };
+      const decisions: any[] = [];
+      let failInsert = false;
+      mockIssueService.getById.mockImplementation(async () => persisted);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>, tx: any) => {
+        const updated = { ...persisted, ...patch, updatedAt: new Date() };
+        if (tx) tx.stagedIssue = updated;
+        else persisted = updated;
+        return updated;
+      });
+      mockIssueService.addComment.mockResolvedValue({ id: "comment-id", body: "Stage decision" });
+      // Emulate commit/rollback to verify the native route puts both writes in
+      // one transaction. This is route proof, not a live database acceptance.
+      mockDb.transaction.mockImplementation(async (callback: any) => {
+        const pendingDecisions: any[] = [];
+        const tx: any = { select: mockDbSelect, stagedIssue: null,
+          insert: vi.fn(() => ({ values: vi.fn(async (decision: any) => {
+            if (failInsert) throw new Error("decision insert failed");
+            pendingDecisions.push(decision);
+          }) })),
+        };
+        const result = await callback(tx);
+        if (tx.stagedIssue) persisted = tx.stagedIssue;
+        decisions.push(...pendingDecisions);
+        return result;
+      });
+      return { owner, reviewer, policy, decisions, current: () => persisted,
+        failInsert: () => { failInsert = true; },
+        drift: (currentParticipant: unknown) => {
+          persisted.executionState = { ...persisted.executionState, currentStageId: policy.stages[1].id,
+            currentStageIndex: 1, currentStageType: "approval", currentParticipant,
+            completedStageIds: [policy.stages[0].id], lastDecisionId: "77777777-7777-4777-8777-777777777777" };
+        },
+      };
+    }
+
+    it.each(["agent", "user"] as const)("persists only review before a separate pending %s approval", async (ownerType) => {
+      const f = fixture(ownerType);
+      const patch = async (actor: TestActor, body: Record<string, unknown>) =>
+        request(await createApp(actor)).patch(`/api/issues/${issueId}`).send(body);
+      const wrongReview = await patch(agentActor(executorId), { status: "done", comment: "Not the reviewer" });
+      expect(wrongReview.status).toBe(422);
+      expect(f.decisions).toEqual([]);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      const noReviewComment = await patch(agentActor(reviewerId), { status: "done" });
+      expect(noReviewComment.status).toBe(422);
+      const reviewed = await patch(agentActor(reviewerId), { status: "done", comment: "Independent review accepted" });
+      expect(reviewed.status).toBe(200);
+      expect(f.current()).toMatchObject({ status: "in_review", assigneeAgentId: f.owner.agentId,
+        assigneeUserId: f.owner.userId, executionState: { status: "pending", currentStageId: f.policy.stages[1].id,
+          currentStageIndex: 1, currentStageType: "approval", currentParticipant: f.owner,
+          returnAssignee: f.owner, completedStageIds: [f.policy.stages[0].id], lastDecisionId: f.decisions[0]?.id } });
+      expect(f.decisions).toEqual([expect.objectContaining({ companyId: "company-1", issueId,
+        stageId: f.policy.stages[0].id, stageType: "review", actorAgentId: reviewerId,
+        actorUserId: null, outcome: "approved", body: "Independent review accepted" })]);
+      const updateTx = mockIssueService.update.mock.calls[0]?.[2];
+      expect(updateTx.insert).toHaveBeenCalledOnce();
+      if (ownerType === "agent") expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(executorId, expect.anything());
+      const wrongApproval = await patch(agentActor(reviewerId), { status: "done", comment: "Not the approver" });
+      expect(wrongApproval.status).toBe(422);
+      expect(f.decisions).toHaveLength(1);
+      const ownerActor: TestActor = ownerType === "agent" ? agentActor(executorId) : {
+        type: "board", userId: "delivery-user", companyIds: ["company-1"], source: "local_implicit", isInstanceAdmin: false,
+      };
+      const noApprovalComment = await patch(ownerActor, { status: "done" });
+      expect(noApprovalComment.status).toBe(422);
+      const approved = await patch(ownerActor, { status: "done", comment: "Separate delivery approval" });
+      expect(approved.status).toBe(200);
+      expect(f.decisions).toHaveLength(2);
+      expect(f.decisions[1]).toMatchObject({ stageId: f.policy.stages[1].id, stageType: "approval", outcome: "approved",
+        actorAgentId: f.owner.agentId, actorUserId: f.owner.userId, body: "Separate delivery approval" });
+      expect(f.current().executionState.completedStageIds).toEqual(f.policy.stages.map((stage) => stage.id));
+    });
+
+    it("keeps an approval-only executor gate pending until a separate decision", async () => {
+      const f = fixture("agent");
+      const approvalPolicy = normalizeIssueExecutionPolicy({ stages: [f.policy.stages[1]] })!;
+      Object.assign(f.current(), { status: "in_progress", assigneeAgentId: executorId,
+        executionPolicy: approvalPolicy, executionState: null });
+      const app = await createApp(agentActor(executorId));
+      const started = await request(app).patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Ready for configured approval" });
+      expect(started.status).toBe(200);
+      expect(f.current()).toMatchObject({ status: "in_review", executionState: {
+        status: "pending", currentStageId: approvalPolicy.stages[0].id,
+        currentParticipant: f.owner, completedStageIds: [], lastDecisionId: null,
+      } });
+      expect(f.decisions).toEqual([]);
+      const approved = await request(app).patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Explicit approval decision" });
+      expect(approved.status).toBe(200);
+      expect(f.decisions).toEqual([expect.objectContaining({ stageId: approvalPolicy.stages[0].id,
+        stageType: "approval", actorAgentId: executorId, outcome: "approved" })]);
+    });
+
+    it("rolls back the review and handoff when decision persistence fails", async () => {
+      const f = fixture("agent");
+      const original = f.current();
+      f.failInsert();
+      const res = await request(await createApp(agentActor(reviewerId))).patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Independent review accepted" });
+      expect(res.status).toBe(500);
+      expect(f.current()).toBe(original);
+      expect(f.decisions).toEqual([]);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+      expect(mockIssueService.update.mock.calls[0]?.[2].insert).toHaveBeenCalledOnce();
+    });
+
+    it.each(["agent", "user"] as const)("reselects the configured %s approval owner without a decision", async (ownerType) => {
+      for (const participant of [null, { type: "agent", agentId: strangerId }]) {
+        const f = fixture(ownerType);
+        f.drift(participant);
+        const res = await request(await createApp(agentActor(reviewerId))).patch(`/api/issues/${issueId}`)
+          .send({ title: "Reconcile pending approval" });
+        expect(res.status).toBe(200);
+        expect(f.current()).toMatchObject({ assigneeAgentId: f.owner.agentId, assigneeUserId: f.owner.userId,
+          executionState: { status: "pending", currentParticipant: f.owner, currentStageId: f.policy.stages[1].id,
+            completedStageIds: [f.policy.stages[0].id], lastDecisionId: "77777777-7777-4777-8777-777777777777" } });
+        expect(f.decisions).toEqual([]);
+      }
+    });
+
+    it("rejects a stage decision from an agent in another company", async () => {
+      const f = fixture("agent");
+      const res = await request(await createApp({ ...agentActor(reviewerId), companyId: "company-2" } as TestActor))
+        .patch(`/api/issues/${issueId}`).send({ status: "done", comment: "Cross-company verdict" });
+      expect(res.status).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(f.decisions).toEqual([]);
+    });
+  });
 });

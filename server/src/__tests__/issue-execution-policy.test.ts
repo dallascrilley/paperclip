@@ -2085,3 +2085,76 @@ describe("review round circuit breaker", () => {
     });
   });
 });
+
+describe("explicit return-owner approval", () => {
+  const principals = [
+    { type: "agent" as const, agentId: coderAgentId, userId: null },
+    { type: "user" as const, agentId: null, userId: boardUserId },
+  ];
+  const reviewer = { type: "agent" as const, agentId: qaAgentId, userId: null };
+  const actorFor = (principal: typeof principals[number] | typeof reviewer) =>
+    ({ agentId: principal.agentId ?? undefined, userId: principal.userId ?? undefined });
+  const assignmentFor = (principal: typeof principals[number] | typeof reviewer) =>
+    ({ assigneeAgentId: principal.agentId, assigneeUserId: principal.userId });
+
+  it.each(principals)("requires separate review and approval decisions for $type return owners", (owner) => {
+    const policy = makePolicy([
+      { type: "review", participants: [owner, reviewer] },
+      { type: "approval", participants: [owner] },
+    ]);
+    const issue = { status: "in_progress", ...assignmentFor(owner), executionPolicy: policy, executionState: null };
+    const transition = (currentIssue: Parameters<typeof applyIssueExecutionPolicyTransition>[0]["issue"], actor: ReturnType<typeof actorFor>, commentBody?: string) =>
+      applyIssueExecutionPolicyTransition({ issue: currentIssue, policy, actor,
+        requestedStatus: "done", requestedAssigneePatch: {}, commentBody });
+    const handoff = transition(issue, actorFor(owner), "Implementation ready");
+    expect(handoff.decision).toBeUndefined();
+    expect(handoff.patch.executionState).toMatchObject({ currentParticipant: reviewer, completedStageIds: [] });
+    const reviewIssue = { ...issue, ...handoff.patch };
+    expect(() => transition(reviewIssue, actorFor(owner), "Cannot review my own work")).toThrow("Only the active");
+    expect(() => transition(reviewIssue, actorFor(reviewer), " ")).toThrow("requires a comment");
+    const reviewed = transition(reviewIssue, actorFor(reviewer), "Independent review accepted");
+    expect(reviewed.decision).toEqual({ stageId: policy.stages[0].id, stageType: "review", outcome: "approved", body: "Independent review accepted" });
+    expect(reviewed.patch).toMatchObject({ status: "in_review", ...assignmentFor(owner), executionState: {
+      status: "pending", currentStageId: policy.stages[1].id, currentStageIndex: 1,
+      currentStageType: "approval", currentParticipant: owner, returnAssignee: owner,
+      completedStageIds: [policy.stages[0].id],
+    } });
+    const approvalIssue = { ...reviewIssue, ...reviewed.patch };
+    expect(() => transition(approvalIssue, actorFor(reviewer), "Cannot decide delivery approval")).toThrow("Only the active");
+    expect(() => transition(approvalIssue, actorFor(owner))).toThrow("requires a comment");
+    const approved = transition(approvalIssue, actorFor(owner), "Delivery approved separately");
+    expect(approved.decision).toMatchObject({ stageId: policy.stages[1].id, stageType: "approval", outcome: "approved" });
+    expect(approved.patch.executionState).toMatchObject({ status: "completed", completedStageIds: policy.stages.map((stage) => stage.id) });
+  });
+
+  it.each(principals)("starts approval-only policy pending for an explicitly configured $type executor", (owner) => {
+    const policy = makePolicy([{ type: "approval", participants: [owner] }]);
+    const result = applyIssueExecutionPolicyTransition({
+      issue: { status: "in_progress", ...assignmentFor(owner), executionPolicy: policy, executionState: null },
+      policy, actor: actorFor(owner), requestedStatus: "done", requestedAssigneePatch: {}, commentBody: "Ready",
+    });
+    expect(result.decision).toBeUndefined();
+    expect(result.patch).toMatchObject({ status: "in_review", executionState: {
+      status: "pending", currentParticipant: owner, completedStageIds: [],
+    } });
+  });
+
+  it.each(principals)("repairs missing and removed approval participants for $type return owners", (owner) => {
+    const policy = makePolicy([{ type: "review", participants: [reviewer] }, { type: "approval", participants: [owner] }]);
+    for (const currentParticipant of [null, { type: "agent", agentId: ctoAgentId }]) {
+      const result = applyIssueExecutionPolicyTransition({
+        issue: { status: "in_review", ...assignmentFor(reviewer), executionPolicy: policy, executionState: {
+          status: "pending", currentStageId: policy.stages[1].id, currentStageIndex: 1,
+          currentStageType: "approval", currentParticipant, returnAssignee: owner,
+          completedStageIds: [policy.stages[0].id], lastDecisionId: "77777777-7777-4777-8777-777777777777", lastDecisionOutcome: "approved",
+        } },
+        policy, actor: actorFor(reviewer), requestedAssigneePatch: {},
+      });
+      expect(result.decision).toBeUndefined();
+      expect(result.patch).toMatchObject({ status: "in_review", ...assignmentFor(owner), executionState: {
+        currentStageId: policy.stages[1].id, currentParticipant: owner,
+        completedStageIds: [policy.stages[0].id], lastDecisionId: "77777777-7777-4777-8777-777777777777",
+      } });
+    }
+  });
+});

@@ -488,7 +488,11 @@ function selectStageParticipant(
     exclude?: IssueExecutionStagePrincipal | null;
   },
 ): IssueExecutionStagePrincipal | null {
-  const participants = stage.participants.filter((participant) => !principalsEqual(participant, opts?.exclude ?? null));
+  // Review requires independence from the executor. Approval instead uses the
+  // explicitly configured authority, which can also be the return owner.
+  const participants = stage.participants.filter((participant) =>
+    stage.type !== "review" || !principalsEqual(participant, opts?.exclude ?? null),
+  );
   if (participants.length === 0) return null;
   if (opts?.preferred) {
     const preferred = participants.find((participant) => principalsEqual(participant, opts.preferred ?? null));

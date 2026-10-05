@@ -108,6 +108,20 @@ and review run. The server reads these records from saved review state; it does
 not depend on the parent session remembering a separate review session. These
 records are evidence and do not grant permission to resolve another review.
 
+For typed execution-policy stages, `review` selects a configured participant
+other than the executor (`returnAssignee`). `approval` selects an explicitly
+configured participant, which can be the return owner. Approval represents the
+configured decision authority. Use a separate `review` stage when independence
+from the executor is required. This also applies to approval-only policies.
+
+A review decision and the next pending approval commit in one transaction.
+The handoff preserves stage IDs and order. It records only the review decision,
+then assigns the pending approval to its participant. It does not record an
+approval automatically. The active approver must submit a separate decision
+with its own comment. Pending-stage repair uses the same participant rules and
+does not create a decision. Existing company checks and explicit board override
+authority still apply.
+
 ### `done`
 
 The work is complete and terminal.
