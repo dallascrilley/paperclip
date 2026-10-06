@@ -312,7 +312,12 @@ function runVitest(args, label, testShard = null) {
   const testRoot = realpathSync(mkdtempSync(path.join(tempRootParent, "pv-")));
   // Extensionless CommonJS CLI fixtures must not inherit another project's
   // package scope from a shared temporary-directory ancestor.
-  writeFileSync(path.join(testRoot, "package.json"), '{"private":true,"type":"commonjs"}\n');
+  const packageManager = JSON.parse(
+    readFileSync(path.join(scriptsDir, "..", "package.json"), "utf8"),
+  ).packageManager;
+  writeFileSync(path.join(testRoot, "package.json"), `${JSON.stringify({
+    private: true, type: "commonjs", packageManager,
+  })}\n`);
   // Keep per-run paths compact so Unix socket fixtures stay under macOS path limits.
   const env = {
     ...process.env,
@@ -321,6 +326,8 @@ function runVitest(args, label, testShard = null) {
     // Config discovery otherwise prefers the checkout's .paperclip/config.json
     // over PAPERCLIP_HOME, importing preview scheduling policy into unit tests.
     PAPERCLIP_CONFIG: path.join(testRoot, "h", "config.json"),
+    // CLI context discovery is separate from instance config discovery.
+    PAPERCLIP_CONTEXT: path.join(testRoot, "h", "context.json"),
     PAPERCLIP_INSTANCE_ID: `vt-${process.pid}-${invocationIndex}`,
     TMPDIR: path.join(testRoot, "t"),
   };
