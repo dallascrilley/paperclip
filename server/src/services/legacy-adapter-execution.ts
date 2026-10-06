@@ -12,6 +12,14 @@ export class LegacyAdapterControllerDetachedError extends Error {
   constructor(cause?: unknown) { super("Supervised legacy adapter controller detached", { cause }); this.name = "LegacyAdapterControllerDetachedError"; }
 }
 
+/** A failure before even attempting custody proves no worker was launched. */
+export class LegacyAdapterPrelaunchError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : "Supervised adapter prelaunch failed", { cause });
+    this.name = "LegacyAdapterPrelaunchError";
+  }
+}
+
 /** Launch once under host custody, then consume through the same fenced path
  * used by the replacement controller.
  */
@@ -27,38 +35,50 @@ export async function executeSupervisedLegacyAdapter(input: {
   project: (event: LegacyAdapterWorkerEvent) => Pick<AppendHeartbeatRunEventInput,
     "eventType" | "stream" | "level" | "color" | "message" | "payload">;
 }) {
-  const context = input.context;
-  context.signal?.throwIfAborted();
-  await context.onCancellationReady?.();
-  context.signal?.throwIfAborted();
-  await input.assertOwned();
-  const binding = { runId: context.runId, companyId: context.agent.companyId,
-    agentId: context.agent.id, adapterType: context.agent.adapterType! };
-  const custody = await reserveLegacyAdapterCustody(input.db, binding, undefined,
-    prepareLegacyAdapterFinalizationInputs(input.preparedFinalization));
-  const root = path.join(input.instanceRoot, "data", "legacy-adapter-workers", binding.companyId, custody.custodyId);
-  await fs.mkdir(root, { recursive: true, mode: 0o700 });
-  await input.assertOwned();
-  await startLegacyAdapterWorker({ root, context, secretValues: input.secretValues, workerEnv: input.workerEnv });
-  return consumeSupervisedLegacyAdapter({
-    db: input.db, instanceRoot: input.instanceRoot, binding, custodyId: custody.custodyId,
-    cursor: custody.eventCursor, signal: context.signal,
-    cancellationRequested: input.cancellationRequested, project: input.project,
-    onCommittedEvents: async events => {
-      for (const event of events) {
-        switch (event.kind) {
-          case "log": await context.onLog(event.stream, event.chunk); break;
-          case "meta": await context.onMeta?.(event.meta as unknown as AdapterInvocationMeta); break;
-          case "event": await context.onEvent?.(event.event as unknown as AdapterRuntimeEvent); break;
-          case "progress": await context.onRuntimeProgress?.(event.progress as unknown as Parameters<RuntimeStatusSink>[0]); break;
-          // Spawn metadata already committed inside the ownership transaction.
-          // Do not repeat the unfenced direct-adapter metadata callback.
-          case "spawn": context.onDispatch?.(); break;
-          case "dispatch": context.onDispatch?.(); break;
+  let reservationAttempted = false;
+  try {
+    const context = input.context;
+    context.signal?.throwIfAborted();
+    await context.onCancellationReady?.();
+    context.signal?.throwIfAborted();
+    await input.assertOwned();
+    const binding = { runId: context.runId, companyId: context.agent.companyId,
+      agentId: context.agent.id, adapterType: context.agent.adapterType! };
+    const preparation = prepareLegacyAdapterFinalizationInputs(input.preparedFinalization);
+    reservationAttempted = true;
+    const custody = await reserveLegacyAdapterCustody(input.db, binding, undefined,
+      preparation);
+    const root = path.join(input.instanceRoot, "data", "legacy-adapter-workers", binding.companyId, custody.custodyId);
+    await fs.mkdir(root, { recursive: true, mode: 0o700 });
+    await input.assertOwned();
+    await startLegacyAdapterWorker({ root, context, secretValues: input.secretValues, workerEnv: input.workerEnv });
+    return await consumeSupervisedLegacyAdapter({
+      db: input.db, instanceRoot: input.instanceRoot, binding, custodyId: custody.custodyId,
+      cursor: custody.eventCursor, signal: context.signal,
+      cancellationRequested: input.cancellationRequested, project: input.project,
+      onCommittedEvents: async events => {
+        for (const event of events) {
+          switch (event.kind) {
+            case "log": await context.onLog(event.stream, event.chunk); break;
+            case "meta": await context.onMeta?.(event.meta as unknown as AdapterInvocationMeta); break;
+            case "event": await context.onEvent?.(event.event as unknown as AdapterRuntimeEvent); break;
+            case "progress": await context.onRuntimeProgress?.(event.progress as unknown as Parameters<RuntimeStatusSink>[0]); break;
+            // Spawn metadata already committed inside the ownership transaction.
+            // Do not repeat the unfenced direct-adapter metadata callback.
+            case "spawn": context.onDispatch?.(); break;
+            case "dispatch": context.onDispatch?.(); break;
+          }
         }
-      }
-    },
-  });
+      },
+    });
+  } catch (error) {
+    // Reservation may have committed even if its acknowledgement failed.
+    // Once attempted, neither a launch error nor missing acknowledgement is
+    // proof of worker termination. Preserve the spool and prepared resources.
+    if (reservationAttempted) throw error instanceof LegacyAdapterControllerDetachedError
+      ? error : new LegacyAdapterControllerDetachedError(error);
+    throw new LegacyAdapterPrelaunchError(error);
+  }
 }
 
 /** Consume an existing worker without adapter configuration, credentials or a

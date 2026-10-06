@@ -4,7 +4,7 @@ import { reconstructLegacyAdapterLogs } from "./legacy-adapter-log-reconstructio
 import { readLegacyAdapterEventBatch } from "./legacy-adapter-events.js";
 import { readDurableChildIdentity } from "@paperclipai/adapter-utils/durable-child-process";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import { executeSupervisedLegacyAdapter, consumeSupervisedLegacyAdapter, LegacyAdapterControllerDetachedError } from "./legacy-adapter-execution.js";
+import { executeSupervisedLegacyAdapter, consumeSupervisedLegacyAdapter, LegacyAdapterControllerDetachedError, LegacyAdapterPrelaunchError } from "./legacy-adapter-execution.js";
 import { publicChatTaskUrl } from "./chat-task-url.js";
 import { toolActionDeliveryService } from "./tool-action-delivery.js";
 import { githubBotConnectionIdsForRun } from "./chat-github-tools.js";
@@ -21120,9 +21120,20 @@ export function heartbeatService(
 
     let legacyAdapterEntered = false;
     let supervisedLegacyExecution = false;
+    let supervisedLegacyWorkerSettled = false;
+    let supervisedWorkspaceFailureRecorder: ((error: unknown) => Promise<void>) | null = null;
     let legacyControllerDetached = false;
     let run = await getRun(runId);
     if (!run) return;
+    const ownsSettledSupervisedRun = async () => {
+      if (!supervisedLegacyExecution) return true;
+      if (!supervisedLegacyWorkerSettled) return false;
+      const current = await getRun(runId).catch(() => null);
+      return Boolean(current && current.controllerBootId === legacyControllerBootId &&
+        (isHeartbeatRunTerminalStatus(current.status) ||
+          (current.status === "running" &&
+            (current.controllerLeaseExpiresAt?.getTime() ?? 0) > Date.now())));
+    };
     if (run.status !== "queued" && run.status !== "running") return;
 
     if (run.status === "queued") {
@@ -25312,10 +25323,11 @@ export function heartbeatService(
                   if (runtimeEnv.PAPERCLIP_ENABLE_LEGACY_SUPERVISION === "1" &&
                       agent.adapterType === "codex_local" && runtimeConfig.engine === "cli" &&
                       !remoteExecution && executionTarget?.kind !== "remote") {
+                    const supervisedSecretValues = await createRunSecretRedactionRegistry(db).resolveValuesForRun(run.companyId, run.id);
                     supervisedLegacyExecution = true;
-                    return executeSupervisedLegacyAdapter({
+                    const supervisedResult = await executeSupervisedLegacyAdapter({
                       db, instanceRoot: options.legacyAdapterWorkerInstanceRoot ?? resolvePaperclipInstanceRoot(), context: adapterExecutionContext,
-                      secretValues: await createRunSecretRedactionRegistry(db).resolveValuesForRun(run.companyId, run.id),
+                      secretValues: supervisedSecretValues,
                       preparedFinalization: {
                         version: 1, taskKey, issueId, configuredModel,
                         scratch: runScratch ? { dir: runScratch.dir, metadata: runScratch.metadata } : null,
@@ -25346,6 +25358,9 @@ export function heartbeatService(
                           redactEventPayload(event) ?? {}, currentUserRedactionOptions,
                         )) }),
                     });
+                    // The consumer returns only after the bound worker join receipt.
+                    supervisedLegacyWorkerSettled = true;
+                    return supervisedResult;
                   }
                   return adapter.execute(adapterExecutionContext);
                 },
@@ -25396,8 +25411,35 @@ export function heartbeatService(
             }
           }
         } catch (adapterErr) {
+          if (adapterErr instanceof LegacyAdapterPrelaunchError) supervisedLegacyWorkerSettled = true;
+          if (supervisedLegacyExecution && !await ownsSettledSupervisedRun()) {
+            legacyControllerDetached = true;
+            throw new LegacyAdapterControllerDetachedError(adapterErr);
+          }
           if (adapterErr instanceof LegacyAdapterControllerDetachedError) {
             legacyControllerDetached = true;
+            throw adapterErr;
+          }
+          if (supervisedLegacyExecution) {
+            // Commit the fenced terminal failure before touching the shared
+            // workspace barrier; a replacement cannot acquire a terminal row.
+            supervisedWorkspaceFailureRecorder = async error => {
+              if (issueRef && context.resumeSessionGoalHeartbeat === true && !runGoalControlRequestId) {
+                await blockRunnerGoalRecovery(db, {
+                  companyId: run.companyId, issueId: issueRef.id, agentId: agent.id, adapterType: agent.adapterType,
+                }, "provider_session_goal_recovery_failed").catch(() => undefined);
+              }
+              if (issueRef && runGoalControlRequestId) {
+                await failRunnerGoalAction(db, {
+                  companyId: run.companyId, issueId: issueRef.id, agentId: agent.id, adapterType: agent.adapterType,
+                }, runGoalControlRequestId, error instanceof Error ? error.message : "session_goal_control_failed")
+                  .catch(() => undefined);
+              }
+              await recordWorkspaceFinalize("failed", {
+                errorMessage: error instanceof Error ? error.message : String(error),
+              }).catch(recordErr => logger.warn({ err: recordErr, runId: run.id },
+                "failed to record supervised workspace_finalize=failed operation; dependents may remain gated"));
+            };
             throw adapterErr;
           }
           if (adapterErr instanceof NativeControllerDetachedForRestartError) {
@@ -25546,7 +25588,7 @@ export function heartbeatService(
           throw adapterErr;
         } finally {
           try {
-            if (!legacyControllerDetached) await revokeHeartbeatRunGatewayTokens({
+            if (!supervisedLegacyExecution && !legacyControllerDetached) await revokeHeartbeatRunGatewayTokens({
               db,
               companyId: agent.companyId,
               runId: run.id,
@@ -25682,6 +25724,10 @@ export function heartbeatService(
           },
         });
       } catch (err) {
+        if (supervisedLegacyExecution && !await ownsSettledSupervisedRun()) {
+          legacyControllerDetached = true;
+          return;
+        }
         if (err instanceof LegacyAdapterControllerDetachedError) {
           legacyControllerDetached = true;
           return;
@@ -25899,7 +25945,10 @@ export function heartbeatService(
           logBytes: logSummary?.bytes,
           logSha256: logSummary?.sha256,
           logCompressed: logSummary?.compressed ?? false,
-        });
+        }, supervisedLegacyExecution ? legacyControllerBootId : undefined);
+        if (supervisedLegacyExecution && !failedRunWrite.updated &&
+            (failedRunWrite.run?.controllerBootId !== legacyControllerBootId ||
+              !isHeartbeatRunTerminalStatus(failedRunWrite.run?.status))) legacyControllerDetached = true;
         if (
           !failedRunWrite.updated &&
           !(
@@ -25918,6 +25967,7 @@ export function heartbeatService(
         }
 
         const failedRun = failedRunWrite.run;
+        await supervisedWorkspaceFailureRecorder?.(err);
         await setWakeupStatus(run.wakeupRequestId, "failed", {
           finishedAt: new Date(),
           error: message,
@@ -26016,6 +26066,11 @@ export function heartbeatService(
         });
       }
     } catch (outerErr) {
+      if (supervisedLegacyExecution && (outerErr instanceof LegacyAdapterControllerDetachedError ||
+          !await ownsSettledSupervisedRun())) {
+        legacyControllerDetached = true;
+        return;
+      }
       if (
         nativeOwnershipHeld ||
         outerErr instanceof NativeRunnerOwnershipUnverifiedError
@@ -26144,7 +26199,10 @@ export function heartbeatService(
             : setupFailureResultJson
               ? { resultJson: setupFailureResultJson }
               : {}),
-        }).catch(() => ({ run: null, updated: false as const }));
+        }, supervisedLegacyExecution ? legacyControllerBootId : undefined).catch(() => ({ run: null, updated: false as const }));
+        if (supervisedLegacyExecution && !setupFailureWrite.updated &&
+            (setupFailureWrite.run?.controllerBootId !== legacyControllerBootId ||
+              !isHeartbeatRunTerminalStatus(setupFailureWrite.run?.status))) legacyControllerDetached = true;
         if (!setupFailureWrite.updated) {
           logger.info(
             {
@@ -26260,10 +26318,18 @@ export function heartbeatService(
         }
       }
     } finally {
-      if (managedAiRuntime && !legacyControllerDetached) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
       let latestRun = await getRun(run.id).catch(() => null);
+      // A terminal row cannot transfer custody. Defer all supervised run-scoped
+      // cleanup until our own terminal commit and actual worker settlement.
+      if (supervisedLegacyExecution && (!supervisedLegacyWorkerSettled ||
+          latestRun?.controllerBootId !== legacyControllerBootId ||
+          !isHeartbeatRunTerminalStatus(latestRun?.status))) legacyControllerDetached = true;
+      if (managedAiRuntime && !legacyControllerDetached) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
+      if (supervisedLegacyExecution && !legacyControllerDetached) await revokeHeartbeatRunGatewayTokens({
+        db, companyId: run.companyId, runId: run.id,
+      }).catch(err => logger.warn({ err, runId: run.id }, "failed to revoke settled supervised gateway tokens"));
       try {
-        if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
+        if (!legacyControllerDetached && latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
           await db
             .update(heartbeatRuns)
             .set({ executionControlDeadlineAt: null })
@@ -26441,7 +26507,7 @@ export function heartbeatService(
       }
       // Terminalization precedes lease and adapter cleanup. Only now is the
       // owner gone; retry pending input for ordinary completions as well as Stop.
-      if (latestRun?.runtimeMode === "legacy" && isHeartbeatRunTerminalStatus(latestRun.status)) {
+      if (!legacyControllerDetached && latestRun?.runtimeMode === "legacy" && isHeartbeatRunTerminalStatus(latestRun.status)) {
         const [pending] = await db.select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
           eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
           eq(agentWakeupRequests.status, "deferred_issue_execution"),
