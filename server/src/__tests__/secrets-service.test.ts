@@ -944,30 +944,39 @@ describeEmbeddedPostgres("secretService", () => {
     });
 
     const events: string[] = [];
+    let markCleanupEntered!: () => void;
+    const cleanupEntered = new Promise<void>((resolve) => {
+      markCleanupEntered = resolve;
+    });
     let releaseCleanup!: () => void;
     const cleanupGate = new Promise<void>((resolve) => {
       releaseCleanup = resolve;
     });
     const cleanupCall = withAccountHomeSecretMutationLock(undefined, companyId, async () => {
       events.push("cleanup-enter");
+      markCleanupEntered();
       await cleanupGate;
       events.push("cleanup-exit");
     });
-    // Give the cleanup a chance to acquire the lock before the AWS create
-    // starts racing for the same lock.
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Start the create only after cleanup owns the lock.
+    await cleanupEntered;
     const createCall = svc.create(companyId, {
       name: `aws-secret-${randomUUID()}`,
       provider: "aws_secrets_manager",
       providerConfigId: awsVault.id,
       value: "runtime-secret",
     });
-    // The AWS create must stay queued behind the held lock, the same way a
-    // `local_encrypted` create does.
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(events).toEqual(["cleanup-enter"]);
-
-    releaseCleanup();
+    try {
+      // The AWS create must stay queued behind the held lock, the same way a
+      // `local_encrypted` create does.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(events).toEqual(["cleanup-enter"]);
+      expect(awsSecretsManagerProvider.createSecret).not.toHaveBeenCalled();
+    } finally {
+      releaseCleanup();
+      // Settle both jobs even if an assertion fails before fixture teardown.
+      await Promise.allSettled([cleanupCall, createCall]);
+    }
     await cleanupCall;
     const created = await createCall;
     expect(events).toEqual(["cleanup-enter", "cleanup-exit"]);
