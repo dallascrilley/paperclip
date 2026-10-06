@@ -31,14 +31,18 @@ its inherited dirty admission implementation belong to this candidate.
 `authorize(peer, request, token, preparation)` returns the exact seven-field
 payload only after independent registration and kernel verification. The peer
 must match allowed uid/gid plus kernel boot, PID birth and PGID. All payload
-fields and the original token must match. Component registration must verify
+fields and the non-empty original common token must match. Null tokens refuse.
+The hook reads peer, payload, token and recovery state from a protected observer
+at each dispatch boundary. Both owning routes also refuse structural recovery. Component registration must verify
 company/agent/task/run/lease and source independently.
 
 `adopt(peer, request, token, successor, leaseId)` requires independent kernel
 and native succession proof. It retains the original launcher/workload and
-rechecks every workload birth. Native lifetime verification must enumerate all
-exec, reparented and warm descendants. A shorter or different original group
-refuses. The API never launches work from recovery.
+rechecks every workload birth and each process PGID. Native lifetime verification must enumerate all
+exec, reparented and warm descendants. The original process set must remain a subset. Each added process needs an
+ancestry link from the owning lifetime verifier to an original process. Kernel
+verification checks each added birth and PGID. Missing original processes,
+unbound additions and predecessor identities refuse. The API never launches work from recovery.
 
 `complete(peer, request, token)` requires the original boot/target/launcher and
 workload, independent completion, no survivors, original launch settlement,
@@ -47,10 +51,14 @@ durable original native queue fence. Authority `fence_absent` with
 `native_launch_settled=false` cannot satisfy this contract. No API releases a
 capacity claim, creates a retry, opens a ledger or executes a native command.
 
-Each primitive must bound its own I/O to the supplied timeout, at most one
-second. Late replies and exceptions return unavailable and `retain_claim=true`.
+The producer races each primitive and observer against a timer, at most one
+second. Each primitive must also bound its own I/O. A timeout, late reply or
+exception returns unavailable and `retain_claim=true`. The timer does not prove
+native launch settlement or completion.
 Preparation checks use the remaining original monotonic deadline. The record
 rejects any interval above 10 seconds, including 180-second intervals.
+Preparation requires `preparedAt <= now < deadline`. Later inspection and
+completion use bounded calls without reopening the preparation window.
 Policy maps B=max(4,requiredGiB,stronger B), G=max(1,stronger G), and
 R=max(2,stronger R). Default B+G+R is 7 GiB. Reflected credit is zero.
 The authority merges reserve once; the producer does not debit it again.
@@ -62,21 +70,34 @@ hooks, immutable original snapshots, deadline/policy checks and synthetic
 verifier fixtures. It does not establish successful production native evidence.
 Default primitives are null and return unavailable.
 
-Existing records support PID/PGID/wall time, controller generation and lease,
-authenticated PRP commands and suspended-session maintenance. These do not
-prove the required native facts. Existing random controller boot UUIDs and
-`ps lstart` or `/proc` directory ctime cannot supply exact kernel boot/birth.
-Rust `process_supervisor.rs` documents the separate inherited lifetime fence
-needed for escaped/reparented descendants.
+`worker-native-kernel.ts` supplies an explicit kernel-only factory. It reuses
+SystemDiagnostics `DarwinKernel.process` from commit
+`feaf477b74d942ee28aa32fa6aad6313409b0ffe`. Protected configuration supplies
+an absolute Python executable and library directory plus pinned SHA256 values.
+The probe verifies and executes the exact module bytes with isolated Python.
+The process deadline and subprocess kill timeout are at most one second.
+The seam reads the kernel boot UUID and exact process birth and PGID. A second
+kernel read checks identity stability. No default path or production caller exists.
 
-The following production primitives remain missing for both routes:
+Kernel module SHA256:
+`b022da978f73df744b262eac25b1020627a6f8fa0fa377df7a7a8db2e7d9bd85`.
+Authority module SHA256:
+`d27acb61f8b796b918bcd3674a3b790110eb50997347dbafd97658a4ff9870f6`.
 
-- Protected original registration and independently verified caller/source.
-- Exact kernel boot/PID birth/PGID and supported controller succession.
-- Exhaustive inherited workload lifetime across exec/warm descendants.
-- Independently verified no-survivors completion.
-- Durable original native launch-queue fence and settlement.
-- Protected durable owning record writer and authenticated provider transport.
+| Primitive | Actual support in this candidate |
+| --- | --- |
+| `registration` | Missing. Kernel-only factory returns false. |
+| `kernel` | Supported through the pinned Darwin seam with explicit protected configuration. Own-PID tests cover boot, birth, PGID and timeout. |
+| `succession` | Missing. Factory returns false. |
+| `lifetime` | Missing. Factory returns null. Synthetic ancestry tests do not prove exhaustive native lifetime. |
+| `completion` | Missing. Factory returns null. Kernel absence cannot prove no survivors. |
+| `fenceLaunch` | Missing. Factory returns null. No durable native queue settlement exists. |
+
+Protected durable registration and authenticated provider transport remain
+missing for both routes. The kernel probe proves no logical ownership,
+controller succession, exhaustive lifetime, completion or launch settlement.
+The producer default remains null. Reserve-bearing dispatch requires the
+non-null durable common token, consistent with PR163 intent/adopt/release.
 
 DAL-76 must not register a concrete provider from these synthetic callbacks.
 It retains authority adapter/service ownership. DAL-61 retains producer-native

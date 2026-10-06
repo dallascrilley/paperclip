@@ -4590,6 +4590,8 @@ export async function runChildProcess(
     }) => Promise<void>;
     /** Optional source-only DAL-80 seam; omitted for pre-activation jobs. */
     nativeEvidence?: WorkerNativeProducerHook;
+    /** Owning recovery path must set this structurally, never from launch intent. */
+    restartRecovery?: boolean;
     terminalResultCleanup?: TerminalResultCleanupOptions;
     stdin?: string;
     remoteExecution?: RemoteExecutionSpec | null;
@@ -4626,6 +4628,7 @@ export async function runChildProcess(
     }
     void (async () => {
       if (opts.nativeEvidence) {
+        if (opts.restartRecovery) throw new Error("worker_native_evidence_recovered_intent_cannot_launch");
         if (opts.remoteExecution) throw new Error("worker_native_evidence_remote_route_refused");
         await opts.nativeEvidence.beforeDispatch("legacy_local", runId);
       }

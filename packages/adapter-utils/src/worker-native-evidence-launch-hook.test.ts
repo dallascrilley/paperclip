@@ -25,3 +25,13 @@ it("legacy owning launch refuses a remote target before native evidence or spawn
   expect(beforeDispatch).not.toHaveBeenCalled();
   expect(spawn).not.toHaveBeenCalled();
 });
+
+it("legacy owning route refuses structurally recovered intent before observer or spawn", async () => {
+  const beforeDispatch = vi.fn(async () => {});
+  await expect(runChildProcess("original-run", "/fixture/no-worker", [], {
+    cwd: process.cwd(), env: {}, timeoutSec: 1, graceSec: 1, onLog: async () => {},
+    nativeEvidence: { route: "legacy_local", beforeDispatch }, restartRecovery: true,
+  })).rejects.toThrow("worker_native_evidence_recovered_intent_cannot_launch");
+  expect(beforeDispatch).not.toHaveBeenCalled();
+  expect(spawn).not.toHaveBeenCalled();
+});
