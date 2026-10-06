@@ -32,6 +32,17 @@ const ORIGINAL_ENV = { ...process.env };
 describe("managed install commands", () => {
   let root: string;
 
+  function uninstallDependencies() {
+    return {
+      platform: "linux" as const,
+      userHomeDir: process.env.HOME!,
+      detectServiceManager: vi.fn(async () => ({
+        supported: false as const,
+        reason: "No background service in this fixture",
+      })),
+    };
+  }
+
   beforeEach(() => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-install-command-"));
     process.env = {
@@ -255,6 +266,7 @@ describe("managed install commands", () => {
       expect(fs.existsSync(paths.shimPath)).toBe(true);
     });
     await uninstallCommand({
+      ...uninstallDependencies(),
       detectServiceManager: vi.fn(async () => ({
         supported: true as const,
         manager: {
@@ -277,6 +289,7 @@ describe("managed install commands", () => {
     fs.writeFileSync(otherUnitPath, "unit");
 
     await expect(uninstallCommand({
+      ...uninstallDependencies(),
       detectServiceManager: vi.fn(async () => ({
         supported: true as const,
         manager: { status: vi.fn(async () => ({ installed: false, active: false })) } as never,
@@ -304,6 +317,7 @@ describe("managed install commands", () => {
     fs.writeFileSync(unitPath, "unit");
 
     await expect(uninstallCommand({
+      ...uninstallDependencies(),
       detectServiceManager: vi.fn(async () => ({
         supported: false as const,
         reason: "No usable systemd user manager was detected",
@@ -335,7 +349,7 @@ describe("managed install commands", () => {
     fs.mkdirSync(paths.cliRoot, { recursive: true });
     fs.writeFileSync(unrelatedFile, "keep");
 
-    await expect(uninstallCommand()).rejects.toThrow("unverified install store");
+    await expect(uninstallCommand(uninstallDependencies())).rejects.toThrow("unverified install store");
     expect(fs.readFileSync(unrelatedFile, "utf8")).toBe("keep");
   });
 
@@ -357,7 +371,7 @@ describe("managed install commands", () => {
 
     await withInstallStoreLock(
       async () => {
-        await expect(uninstallCommand()).rejects.toThrow("already running");
+        await expect(uninstallCommand(uninstallDependencies())).rejects.toThrow("already running");
       },
       paths,
     );

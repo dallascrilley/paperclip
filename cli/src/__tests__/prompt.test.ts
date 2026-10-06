@@ -2,13 +2,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { writeContext } from "../client/context.js";
+import { defaultClientContext, writeContext } from "../client/context.js";
 import { runAgentPrompt, runBoardPrompt } from "../commands/client/prompt.js";
 
 const ORIGINAL_ENV = { ...process.env };
+const contextDirs = new Set<string>();
 
 function createTempContextPath(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-cli-prompt-"));
+  contextDirs.add(dir);
   return path.join(dir, "context.json");
 }
 
@@ -27,11 +29,17 @@ function agent(overrides: Record<string, unknown> = {}) {
 describe("prompt handoff", () => {
   beforeEach(() => {
     process.env = { ...ORIGINAL_ENV };
+    process.env.PAPERCLIP_CONTEXT = createTempContextPath();
+    writeContext(defaultClientContext());
     delete process.env.PAPERCLIP_API_KEY;
     vi.restoreAllMocks();
   });
 
   afterEach(() => {
+    for (const dir of contextDirs) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+    contextDirs.clear();
     process.env = { ...ORIGINAL_ENV };
     vi.restoreAllMocks();
   });

@@ -2,10 +2,11 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { doctor } from "../commands/doctor.js";
 import { writeConfig } from "../config/store.js";
 import type { PaperclipConfig } from "../config/schema.js";
+import * as serviceManager from "../services/service-manager.js";
 
 const ORIGINAL_ENV = { ...process.env };
 
@@ -20,8 +21,7 @@ async function availablePort(): Promise<number> {
   return address.port;
 }
 
-function createTempConfig(serverPort: number): string {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-doctor-"));
+function createTempConfig(root: string, serverPort: number): string {
   const configPath = path.join(root, ".paperclip", "config.json");
   const runtimeRoot = path.join(root, "runtime");
 
@@ -87,19 +87,32 @@ function createTempConfig(serverPort: number): string {
 }
 
 describe("doctor", () => {
+  let root: string;
+
   beforeEach(() => {
-    process.env = { ...ORIGINAL_ENV };
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-doctor-"));
+    process.env = {
+      ...ORIGINAL_ENV,
+      HOME: root,
+      PAPERCLIP_HOME: path.join(root, ".paperclip"),
+    };
+    vi.spyOn(serviceManager, "detectServiceManager").mockResolvedValue({
+      supported: false,
+      reason: "No background service in this fixture",
+    });
     delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
     delete process.env.PAPERCLIP_SECRETS_MASTER_KEY;
     delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     process.env = { ...ORIGINAL_ENV };
+    fs.rmSync(root, { recursive: true, force: true });
   });
 
   it("re-runs repairable checks so repaired failures do not remain blocking", async () => {
-    const configPath = createTempConfig(await availablePort());
+    const configPath = createTempConfig(root, await availablePort());
 
     const summary = await doctor({
       config: configPath,
