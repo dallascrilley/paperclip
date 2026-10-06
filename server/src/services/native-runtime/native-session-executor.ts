@@ -1,3 +1,4 @@
+import type { WorkerNativeProducerHook } from "@paperclipai/adapter-utils/worker-native-evidence";
 import { bindManagedNativeCredentialTurn, completeManagedNativeCredentialTurn } from "./managed-native-credentials.js";
 import { createLocalNativeQuestionBridge } from "./local-native-question-bridge.js";
 import { readVerifiedRemoteWorkspaceFile } from "./remote-deliverable-file.js";
@@ -6923,6 +6924,8 @@ function startNativeSessionExecutionLeaseRenewal(input: {
 }
 
 export async function executePaperclipNativeSession(input: {
+  /** Source-only producer seam, omitted for unreserved pre-activation work. */
+  nativeEvidence?: WorkerNativeProducerHook;
   db: Db;
   execution: NativeExecutionInput;
   runnerInstanceId: string;
@@ -6981,6 +6984,11 @@ export async function executePaperclipNativeSession(input: {
   ) => Promise<unknown>;
 }): Promise<AdapterExecutionResult> {
   const runId = input.execution.binding.runId;
+  if (input.nativeEvidence) {
+    if (input.restartRecovery) throw new Error("worker_native_evidence_recovered_intent_cannot_launch");
+    if (input.runnerExecutionTarget?.kind === "remote") throw new Error("worker_native_evidence_remote_route_refused");
+    await input.nativeEvidence.beforeDispatch("native_local", runId);
+  }
   if (nativeSessionStartups.has(runId)) {
     throw new Error("native_session_supervisor_busy");
   }
@@ -7993,6 +8001,10 @@ async function executePaperclipNativeSessionWithinScope(
         const result = await trace.run(runnerSessionStartupScope, () =>
           executeNativeSession({
             onSessionAdmission: async () => {
+              if (input.nativeEvidence) {
+                if (input.runnerExecutionTarget?.kind === "remote") throw new Error("worker_native_evidence_remote_route_refused");
+                await input.nativeEvidence.beforeDispatch("native_local", input.execution.binding.runId);
+              }
               // Invalidate prior stop evidence before a backend can spawn.
               await appendHeartbeatRunEvent(input.db, {
                 companyId: input.execution.binding.companyId,

@@ -1,3 +1,4 @@
+import type { WorkerNativeProducerHook } from "./worker-native-evidence.js";
 import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -4587,6 +4588,8 @@ export async function runChildProcess(
       processGroupId: number | null;
       startedAt: string;
     }) => Promise<void>;
+    /** Optional source-only DAL-80 seam; omitted for pre-activation jobs. */
+    nativeEvidence?: WorkerNativeProducerHook;
     terminalResultCleanup?: TerminalResultCleanupOptions;
     stdin?: string;
     remoteExecution?: RemoteExecutionSpec | null;
@@ -4621,12 +4624,20 @@ export async function runChildProcess(
     if (opts.localProcessSandbox?.homeDir) {
       mergedEnv.HOME = opts.localProcessSandbox.homeDir;
     }
-    void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
-      remoteExecution: opts.remoteExecution ?? null,
-      remoteEnv: opts.remoteExecution ? opts.env : null,
-      localProcessSandbox: opts.localProcessSandbox ?? null,
-    })
-      .then((target) => {
+    void (async () => {
+      if (opts.nativeEvidence) {
+        if (opts.remoteExecution) throw new Error("worker_native_evidence_remote_route_refused");
+        await opts.nativeEvidence.beforeDispatch("legacy_local", runId);
+      }
+      return resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
+        remoteExecution: opts.remoteExecution ?? null,
+        remoteEnv: opts.remoteExecution ? opts.env : null,
+        localProcessSandbox: opts.localProcessSandbox ?? null,
+      });
+    })()
+      .then(async (target) => {
+        // Same original deadline after potentially asynchronous target preparation.
+        await opts.nativeEvidence?.beforeDispatch("legacy_local", runId);
         const childEnv = { ...mergedEnv, ...target.env };
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
