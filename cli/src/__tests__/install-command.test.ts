@@ -144,6 +144,9 @@ describe("managed install commands", () => {
       }
       if (file === "bash") return { stdout: "", stderr: "" };
       if (file === "npm" && args[0] === "pack") {
+        if (args[1]?.includes("workspace-package-") && !args.includes("--ignore-scripts")) {
+          throw new Error("Staged package prepack cannot access source build scripts");
+        }
         const packageName = args[1]?.includes("workspace-package-")
           ? JSON.parse(fs.readFileSync(path.join(args[1], "package.json"), "utf8")).name.replace("@", "").replace("/", "-")
           : "paperclipai";
