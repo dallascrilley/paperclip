@@ -1080,8 +1080,9 @@ arguments. For `sh -c` or `bash -c`, the first argument after the script is
 argument as literal data. It does not replace the requested shell.
 
 Command-specific environment values use `exec env KEY=VALUE command ...`.
-These values take precedence over login-profile values. Shell metacharacters
-in environment values or arguments do not become new commands.
+These values override the outer SSH wrapper's profile values. A requested
+login shell can then apply its own profile. Shell metacharacters in environment
+values or arguments do not become new commands.
 
 Run the focused contract checks with:
 
