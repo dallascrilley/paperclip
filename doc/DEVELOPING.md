@@ -1072,6 +1072,23 @@ versions across directories. With these artifacts preinstalled, startup links
 and verifies them without uploading a binary or installing packages. Deploy
 the updated sandbox image with the matching runner qualification changes.
 
+### SSH command argument contract
+
+The command-managed SSH runner preserves the requested executable and all
+arguments. For `sh -c` or `bash -c`, the first argument after the script is
+`$0`; later arguments remain `$1`, `$2`, and so on. The runner quotes each
+argument as literal data. It does not replace the requested shell.
+
+Command-specific environment values use `exec env KEY=VALUE command ...`.
+These values take precedence over login-profile values. Shell metacharacters
+in environment values or arguments do not become new commands.
+
+Run the focused contract checks with:
+
+```sh
+pnpm exec vitest run --project @paperclipai/adapter-utils packages/adapter-utils/src/ssh-command-runner.test.ts
+```
+
 ### Native runner restart recovery
 
 Paperclip Runner keeps its heartbeat run, native session, logical runner, and
