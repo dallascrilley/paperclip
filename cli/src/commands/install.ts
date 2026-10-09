@@ -281,6 +281,10 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("corepack", ["pnpm", "--filter", "@paperclipai/server", "prepare:ui-dist"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
+    const workspaceVersions = new Map(workspacePackages.map((entry) => {
+      const manifest = JSON.parse(fs.readFileSync(path.join(checkoutPath, entry.dir, "package.json"), "utf8")) as { version: string };
+      return [entry.name, manifest.version];
+    }));
     for (const [index, workspacePackage] of workspacePackages.entries()) {
       const packageDir = path.join(checkoutPath, workspacePackage.dir);
       const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { files?: string[]; bundleDependencies?: string[]; bundledDependencies?: string[] };
@@ -293,6 +297,22 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       if (bundledDependencies.length > 0) {
         const stagedPackage = path.join(stagingRoot, `workspace-package-${index}`);
         await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "prepare-bundled-package.mjs"), packageDir, stagedPackage], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+        // The shared release helper assumes one version for all packages. Git
+        // checkouts can contain independently versioned workspaces (plugin-sdk).
+        const stagedManifestPath = path.join(stagedPackage, "package.json");
+        const stagedManifest = JSON.parse(fs.readFileSync(stagedManifestPath, "utf8"));
+        const sourceManifest = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8"));
+        for (const section of ["dependencies", "optionalDependencies", "peerDependencies"]) {
+          for (const [name, specifier] of Object.entries(sourceManifest[section] ?? {})) {
+            if (typeof specifier !== "string" || !specifier.startsWith("workspace:")) continue;
+            const version = workspaceVersions.get(name);
+            if (!version) throw new Error(`Missing Git workspace version for ${name}.`);
+            const range = specifier.slice("workspace:".length);
+            stagedManifest[section] ??= {};
+            stagedManifest[section][name] = range === "*" ? version : range === "^" || range === "~" ? `${range}${version}` : range;
+          }
+        }
+        fs.writeFileSync(stagedManifestPath, `${JSON.stringify(stagedManifest, null, 2)}\n`);
         // Staged packages contain built artifacts, not the source build scripts.
         // Match the release helper and do not rerun their prepack lifecycle.
         await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot, "--ignore-scripts"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });

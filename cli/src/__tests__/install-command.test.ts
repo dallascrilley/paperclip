@@ -113,7 +113,7 @@ describe("managed install commands", () => {
         const checkout = args[args.indexOf("-C") + 1];
         const packages = [
           { dir: "packages/shared", name: "@paperclipai/shared", packageJson: { name: "@paperclipai/shared", version: "0.3.1" } },
-          { dir: "packages/db", name: "@paperclipai/db", packageJson: { name: "@paperclipai/db", version: "0.3.1", dependencies: { "@paperclipai/shared": "workspace:*" }, bundleDependencies: ["embedded-postgres"] } },
+          { dir: "packages/db", name: "@paperclipai/db", packageJson: { name: "@paperclipai/db", version: bundledServer ? "1.0.0" : "0.3.1", dependencies: { "@paperclipai/shared": "workspace:*" }, bundleDependencies: ["embedded-postgres"] } },
           { dir: "server", name: "@paperclipai/server", packageJson: { name: "@paperclipai/server", version: "0.3.1", dependencies: { "@paperclipai/db": "workspace:*" }, ...(bundledServer ? { files: ["ui-dist", "skills"], bundleDependencies: ["ws"] } : {}) } },
         ];
         fs.mkdirSync(path.join(checkout, "skills", "fixture"), { recursive: true });
@@ -146,6 +146,12 @@ describe("managed install commands", () => {
       if (file === "npm" && args[0] === "pack") {
         if (args[1]?.includes("workspace-package-") && !args.includes("--ignore-scripts")) {
           throw new Error("Staged package prepack cannot access source build scripts");
+        }
+        if (bundledServer && args[1]?.includes("workspace-package-")) {
+          const staged = JSON.parse(fs.readFileSync(path.join(args[1], "package.json"), "utf8"));
+          if (staged.name === "@paperclipai/server") {
+            expect(staged.dependencies["@paperclipai/db"]).toBe("1.0.0");
+          }
         }
         const packageName = args[1]?.includes("workspace-package-")
           ? JSON.parse(fs.readFileSync(path.join(args[1], "package.json"), "utf8")).name.replace("@", "").replace("/", "-")
