@@ -114,8 +114,10 @@ describe("managed install commands", () => {
         const packages = [
           { dir: "packages/shared", name: "@paperclipai/shared", packageJson: { name: "@paperclipai/shared", version: "0.3.1" } },
           { dir: "packages/db", name: "@paperclipai/db", packageJson: { name: "@paperclipai/db", version: "0.3.1", dependencies: { "@paperclipai/shared": "workspace:*" }, bundleDependencies: ["embedded-postgres"] } },
-          { dir: "server", name: "@paperclipai/server", packageJson: { name: "@paperclipai/server", version: "0.3.1", dependencies: { "@paperclipai/db": "workspace:*" }, ...(bundledServer ? { files: ["ui-dist"], bundleDependencies: ["ws"] } : {}) } },
+          { dir: "server", name: "@paperclipai/server", packageJson: { name: "@paperclipai/server", version: "0.3.1", dependencies: { "@paperclipai/db": "workspace:*" }, ...(bundledServer ? { files: ["ui-dist", "skills"], bundleDependencies: ["ws"] } : {}) } },
         ];
+        fs.mkdirSync(path.join(checkout, "skills", "fixture"), { recursive: true });
+        fs.writeFileSync(path.join(checkout, "skills", "fixture", "SKILL.md"), "Synthetic published skill");
         fs.mkdirSync(path.join(checkout, "cli"), { recursive: true });
         fs.writeFileSync(path.join(checkout, "cli", "package.json"), JSON.stringify({ version: "0.3.1" }));
         fs.mkdirSync(path.join(checkout, "scripts"), { recursive: true });
@@ -154,6 +156,10 @@ describe("managed install commands", () => {
         for (const entry of packageJson.files ?? []) {
           if (!fs.existsSync(path.join(args[1], entry))) throw new Error(`Missing package file: ${entry}`);
         }
+        if (packageJson.files?.includes("skills")) {
+          expect(fs.readFileSync(path.join(args[1], "skills", "fixture", "SKILL.md"), "utf8"))
+            .toBe("Synthetic published skill");
+        }
         fs.mkdirSync(args[2], { recursive: true });
         fs.writeFileSync(path.join(args[2], "package.json"), JSON.stringify(packageJson));
         return { stdout: "", stderr: "" };
@@ -179,7 +185,7 @@ describe("managed install commands", () => {
     expect(installCall?.[1].filter((arg) => arg.endsWith(".tgz"))).toHaveLength(4);
   });
 
-  it("includes the built UI when the server uses bundled dependency staging", async () => {
+  it("includes built UI and runtime skills when the server uses bundled dependency staging", async () => {
     const runCommand = createGitCheckoutRunCommand("e".repeat(40), true);
     await expect(installGitPayload("paperclipai/paperclip", "e".repeat(40), runCommand, resolveInstallStorePaths()))
       .resolves.toMatchObject({ version: "0.3.1", reused: false });

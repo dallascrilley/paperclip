@@ -283,7 +283,12 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
     for (const [index, workspacePackage] of workspacePackages.entries()) {
       const packageDir = path.join(checkoutPath, workspacePackage.dir);
-      const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { bundleDependencies?: string[]; bundledDependencies?: string[] };
+      const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { files?: string[]; bundleDependencies?: string[]; bundledDependencies?: string[] };
+      if (packageJson.files?.includes("skills")) {
+        const skillsPath = path.join(packageDir, "skills");
+        fs.rmSync(skillsPath, { recursive: true, force: true });
+        fs.cpSync(path.join(checkoutPath, "skills"), skillsPath, { recursive: true });
+      }
       const bundledDependencies = packageJson.bundleDependencies ?? packageJson.bundledDependencies ?? [];
       if (bundledDependencies.length > 0) {
         const stagedPackage = path.join(stagingRoot, `workspace-package-${index}`);
