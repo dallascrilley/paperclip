@@ -26,7 +26,9 @@ use super::{
 
 const SECURE_FRAME_SCHEMA: &str = "paperclip.runner.secure-frame.v1";
 const AUTH_TIMEOUT: Duration = Duration::from_secs(2);
-const WELCOME_TIMEOUT: Duration = Duration::from_secs(2);
+// Ticket and lease persistence can exceed two seconds on a loaded controller.
+// Keep this bounded by the connection lifecycle deadline and ticket expiry.
+const WELCOME_TIMEOUT: Duration = Duration::from_secs(10);
 const RUNTIME_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -2061,6 +2063,53 @@ mod tests {
         ] {
             assert!(validate_listener_path(path).is_err(), "{path}");
         }
+    }
+
+    #[test]
+    fn delayed_bootstrap_welcome_survives_controller_persistence() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut config = config(port);
+        config.max_runtime = Duration::from_secs(10);
+        let state = test_state(&config);
+        let server_config = config.clone();
+        let server_state = state.clone();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = accept(stream).unwrap();
+            let expires = current_unix_ms().unwrap() + 60_000;
+            let mut secure = server_authenticate(
+                &mut socket,
+                &server_config,
+                &server_state,
+                ServerCredential {
+                    token: "bootstrap-secret",
+                    kind: "bootstrap",
+                    lease_id: None,
+                    expires_at_unix_ms: expires,
+                    revocation_epoch: 0,
+                },
+            );
+            // A real controller must persist the consumed ticket and lease
+            // before sending welcome; this exceeds the former two-second bound.
+            thread::sleep(Duration::from_millis(2500));
+            send_secure(
+                &mut socket,
+                &mut secure,
+                &server_config,
+                &welcome(&server_state, "connection_1", Some("lease-secret"), expires, 0, vec![]),
+            );
+        });
+        let endpoint = RunnerTransportEndpoint::new(&config.connect_url, &config.run_id).unwrap();
+        let ticket = BootstrapTicket::new("bootstrap-secret".to_owned()).unwrap();
+        let result = AuthenticatedTransport::connect(
+            &endpoint, &config, &state, Some(&ticket), None,
+            Instant::now() + config.max_runtime,
+        );
+        server.join().unwrap();
+        let (_, accepted) = result.unwrap().unwrap();
+        assert_eq!(accepted.connection.connection_id, "connection_1");
+        assert_eq!(accepted.lease.unwrap().expose().unwrap(), "lease-secret");
     }
 
     #[test]
