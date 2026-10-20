@@ -1,5 +1,5 @@
 import { openEvalOperations, type EvalOperations } from "./operations.js";
-import { EVAL_OBSERVABILITY_SECRET_NAMES } from "./braintrust.js";
+import { EVAL_OBSERVABILITY_SECRET_NAMES, evalBraintrustConfig, finalizeEvalAttemptTrace } from "./braintrust.js";
 import { runnerE2EPlaywrightInvocation } from "./web-server-command.js";
 import { verifyInstalledDaytonaPlugin } from "./installed-daytona-plugin.js";
 import { assertInstalledCliSelection, assertInstalledStartupOnly, verifyInstalledCli } from "./installed-cli.js";
@@ -475,6 +475,7 @@ async function runAttempt(input: {
   const { executions, attempt, campaignId, options } = input;
   const accountingCampaignId = input.operations?.manifest.limits.campaignId ?? process.env.PAPERCLIP_E2E_ACCOUNTING_CAMPAIGN_ID ?? campaignId;
   const accountingAttemptId = randomBytes(16).toString("hex");
+  const traceConfig = evalBraintrustConfig(process.env);
   const execution = executions[0];
   if (!execution) throw new Error("A runner E2E cell must contain a task case");
   if (
@@ -932,6 +933,22 @@ async function runAttempt(input: {
       // the same campaign. The result above carries the terminal failure.
       console.error(message);
       if (options.installedStartupOnly) throw new Error(message);
+    }
+    for (const result of publishedResults) {
+      const resultPath = publishedResultPaths.get(result.executionId);
+      const candidate = executions.find(candidate => candidate.id === result.executionId);
+      if (!traceConfig || !result.tracing || !resultPath || !candidate) continue;
+      result.tracing.finalization = await finalizeEvalAttemptTrace(traceConfig, {
+        receipt: result.tracing,
+        identity: { campaignId: accountingCampaignId, attemptId: accountingAttemptId, executionId: candidate.id,
+          provider: candidate.profile.provider, model: candidate.profile.model, environment: candidate.environment.id },
+        provenance: { suiteId: candidate.suite.id, suiteDefinitionHash: candidate.suiteDefinitionHash, profileId: candidate.profile.id,
+          caseId: candidate.task.id, sourceRevision: resolveRunnerE2ESource().sha },
+        result,
+      });
+      const safeResult = `${JSON.stringify(sanitizeJson(result, attemptSecrets), null, 2)}\n`;
+      assertSecretFree(safeResult, attemptSecrets, resultPath);
+      await writeFile(resultPath, safeResult, "utf8");
     }
   }
 }

@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
 import type { RunnerApi } from "./api.js";
+import type { FailureClass, RunnerE2EResult } from "./types.js";
 
 export const EVAL_OBSERVABILITY_SECRET_NAMES = ["BRAINTRUST_API_KEY"] as const;
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -15,7 +16,7 @@ export function evalBraintrustConfig(env: NodeJS.ProcessEnv): EvalBraintrustConf
 }
 
 type Attributes = Record<string, string | number | boolean | string[]>;
-type Phase = "setup" | "execution" | "feedback" | "cleanup";
+type Phase = "setup" | "execution" | "feedback" | "cleanup" | "finalization";
 interface PhaseSpan { name: Phase; spanId: string; start: number; end?: number; failed?: boolean }
 export interface EvalTraceIdentity { campaignId: string; attemptId: string; executionId: string; provider: string; model: string; environment: string }
 export interface EvalTraceProvenance {
@@ -27,6 +28,11 @@ export interface EvalTraceReceipt {
   verification: "unverified";
   nativeConfiguration: "not_started" | "configured" | "failed";
   companyId?: string; revision?: string; errorCode?: string; httpStatus?: number;
+  finalization?: EvalFinalizationReceipt;
+}
+export interface EvalFinalizationReceipt {
+  spanId: string; status: "accepted" | "failed"; outcome: "passed" | "failed"; verification: "unverified";
+  errorCode?: string; httpStatus?: number;
 }
 const require = createRequire(new URL("../../server/package.json", import.meta.url));
 const time = (ms: number): [number, number] => [Math.floor(ms / 1000), (ms % 1000) * 1_000_000];
@@ -45,19 +51,32 @@ export class EvalAttemptTrace {
   private readonly phases: PhaseSpan[] = [];
   private active?: PhaseSpan;
   private readonly receipt: EvalTraceReceipt;
-  constructor(private readonly config: EvalBraintrustConfig, private readonly identity: EvalTraceIdentity, private readonly provenance?: EvalTraceProvenance) {
-    if (Object.values(identity).some(value => !value || value.length > 512 || /[\r\n]/.test(value))) throw new Error("Invalid eval trace identity");
-    if (provenance && (Object.values(provenance).some(value => value !== null && (!value || value.length > 512 || /[\r\n]/.test(value)))
+  constructor(private readonly config: EvalBraintrustConfig, private readonly identity: EvalTraceIdentity, private readonly provenance?: EvalTraceProvenance,
+    context?: { receipt: EvalTraceReceipt; startedAtMs: number }) {
+    if (Object.values(identity).some(value => typeof value !== "string" || !value || value.length > 512 || /[\r\n]/.test(value))) throw new Error("Invalid eval trace identity");
+    if (provenance && (Object.values(provenance).some(value => value !== null && (typeof value !== "string" || !value || value.length > 512 || /[\r\n]/.test(value)))
         || !/^[0-9a-f]{64}$/.test(provenance.suiteDefinitionHash)
         || provenance.sourceRevision !== null && !/^[0-9a-f]{40}$/.test(provenance.sourceRevision))) throw new Error("Invalid eval trace provenance");
     this.receipt = { projectId: config.projectId, traceId: randomBytes(16).toString("hex"), spanId: randomBytes(8).toString("hex"),
       status: "pending", verification: "unverified", nativeConfiguration: "not_started" };
+    if (context) {
+      const { receipt, startedAtMs } = context;
+      exportBraintrustAttemptParent(receipt);
+      if (receipt.projectId !== config.projectId || !Number.isFinite(startedAtMs) || startedAtMs < 0 || startedAtMs > Date.now()
+          || !["not_started", "configured", "failed"].includes(receipt.nativeConfiguration)
+          || receipt.companyId !== undefined && !uuid.test(receipt.companyId)
+          || receipt.revision !== undefined && !uuid.test(receipt.revision)) throw new Error("Invalid eval finalization context");
+      this.startedAt = startedAtMs;
+      Object.assign(this.receipt, { traceId: receipt.traceId, spanId: receipt.spanId, nativeConfiguration: receipt.nativeConfiguration,
+        ...(receipt.companyId ? { companyId: receipt.companyId } : {}), ...(receipt.revision ? { revision: receipt.revision } : {}) });
+    }
   }
   snapshot(): EvalTraceReceipt { return { ...this.receipt }; }
   phase(name: Phase, previousFailed = false) {
     this.endPhase(previousFailed);
     this.active = { name, spanId: randomBytes(8).toString("hex"), start: Date.now() };
     this.phases.push(this.active);
+    return this.active.spanId;
   }
   endPhase(failed = false) {
     if (this.active) { this.active.end = Date.now(); this.active.failed = failed; this.active = undefined; }
@@ -85,7 +104,8 @@ export class EvalAttemptTrace {
       throw new Error("Eval native observability configuration failed; response withheld");
     }
   }
-  async export(input: { failed: boolean; runIds: string[]; cleanup: string; complaints: number; suggestions: number }, transport: typeof fetch = fetch): Promise<EvalTraceReceipt> {
+  async export(input: { failed: boolean; runIds: string[]; cleanup: string; complaints: number; suggestions: number;
+    outcomeStage?: "worker" | "supervisor"; failureClass?: FailureClass }, transport: typeof fetch = fetch): Promise<EvalTraceReceipt> {
     this.endPhase(input.failed);
     const endedAt = Date.now();
     const { resourceFromAttributes } = require("@opentelemetry/resources") as { resourceFromAttributes(attributes: Attributes): unknown };
@@ -96,6 +116,8 @@ export class EvalAttemptTrace {
       "paperclip.eval.campaign_id": this.identity.campaignId, "paperclip.eval.attempt_id": this.identity.attemptId,
       "paperclip.eval.execution_id": this.identity.executionId, "paperclip.eval.provider": this.identity.provider,
       "paperclip.eval.model": this.identity.model, "paperclip.eval.environment": this.identity.environment,
+      "paperclip.eval.outcome_stage": input.outcomeStage ?? "worker", "paperclip.eval.outcome": input.failed ? "failed" : "passed",
+      ...(input.failureClass ? { "paperclip.eval.failure_class": input.failureClass } : {}),
       "paperclip.eval.cleanup": input.cleanup, "paperclip.eval.run_ids": input.runIds,
       "paperclip.eval.feedback.complaints": input.complaints, "paperclip.eval.feedback.suggestions": input.suggestions,
       ...(this.provenance ? {
@@ -158,4 +180,28 @@ export class EvalAttemptTrace {
     }
     return this.snapshot();
   }
+}
+
+export async function finalizeEvalAttemptTrace(config: EvalBraintrustConfig, input: {
+  receipt: EvalTraceReceipt; identity: EvalTraceIdentity; provenance: EvalTraceProvenance;
+  result: Pick<RunnerE2EResult, "startedAt" | "status" | "cleanup" | "runIds" | "feedback" | "failureClass">;
+}, transport: typeof fetch = fetch): Promise<EvalFinalizationReceipt> {
+  const failed = input.result.status !== "passed" || input.result.cleanup !== "passed";
+  const receipt: EvalFinalizationReceipt = { spanId: randomBytes(8).toString("hex"), status: "failed", outcome: failed ? "failed" : "passed", verification: "unverified" };
+  try {
+    if (!["passed", "failed"].includes(input.result.status) || !["not_started", "passed", "failed"].includes(input.result.cleanup)
+        || input.result.failureClass !== undefined && !["candidate_failure", "provider_variance", "transient_infrastructure", "permanent_infrastructure", "secret_leak", "cleanup_failure"].includes(input.result.failureClass)
+        || input.result.runIds !== undefined && (!Array.isArray(input.result.runIds) || input.result.runIds.some(id => !uuid.test(id)))
+        || [input.result.feedback?.complaints ?? 0, input.result.feedback?.suggestions ?? 0].some(count => !Number.isSafeInteger(count) || count < 0)) throw new Error("Invalid eval finalization result");
+    const trace = new EvalAttemptTrace(config, input.identity, input.provenance, { receipt: input.receipt, startedAtMs: Date.parse(input.result.startedAt) });
+    receipt.spanId = trace.phase("finalization");
+    const exported = await trace.export({ failed, outcomeStage: "supervisor", failureClass: input.result.failureClass,
+      runIds: input.result.runIds ?? [], cleanup: input.result.cleanup,
+      complaints: input.result.feedback?.complaints ?? 0, suggestions: input.result.feedback?.suggestions ?? 0,
+    }, transport);
+    receipt.status = exported.status === "accepted" ? "accepted" : "failed";
+    if (exported.httpStatus !== undefined) receipt.httpStatus = exported.httpStatus;
+    if (exported.errorCode) receipt.errorCode = exported.errorCode;
+  } catch { receipt.errorCode = "invalid_finalization_context"; }
+  return receipt;
 }

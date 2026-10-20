@@ -2647,10 +2647,14 @@ credential-header path, outside browser evidence.
 
 Attempt spans include suite ID and definition hash, profile, case, configured
 provider/model, source revision (or explicit `unknown`), and the runner-spec grader
-path. The source revision identifies that grader's implementation. This exporter
-records the worker outcome before supervisor packaging; it does not yet certify
-the final evidence-package or outer-cleanup outcome. Orchestration spans omit model
-usage and cost metrics. Gateway model logging remains a separate observation lane;
+path. The source revision identifies that grader's implementation. Worker exports
+are marked `paperclip.eval.outcome_stage=worker`. After evidence packaging,
+gateway shutdown and outer cleanup, the supervisor updates the same attempt root
+with its final outcome and adds a finalization span. This preserves failures first
+discovered after the worker returned. The result retains a separate finalization
+export receipt; old or killed attempts can explicitly lack one. Export failure
+remains separate from the product grade. Orchestration spans omit model usage and
+cost metrics. Gateway model logging remains a separate observation lane;
 its model costs must not be added to native costs without a verified request join.
 The separate provider connection suite and standalone judges do not yet use this
 attempt exporter.

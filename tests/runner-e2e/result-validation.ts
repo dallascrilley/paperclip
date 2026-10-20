@@ -128,6 +128,8 @@ const tracing = shape({
   projectId: string, traceId: string, spanId: string, status: oneOf("pending", "accepted", "failed"),
   verification: oneOf("unverified"), nativeConfiguration: oneOf("not_started", "configured", "failed"),
   companyId: optional(string), revision: optional(string), errorCode: optional(string), httpStatus: optional(number),
+  finalization: optional(shape({ spanId: string, status: oneOf("accepted", "failed"), outcome: oneOf("passed", "failed"),
+    verification: oneOf("unverified"), errorCode: optional(string), httpStatus: optional(number) })),
 });
 const feedback = shape({
   version: (value, at) => { if (value !== 1) invalid(at); },

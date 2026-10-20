@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { afterEach, expect, it, vi } from "vitest";
-import { EvalAttemptTrace, evalBraintrustConfig, exportBraintrustAttemptParent } from "./braintrust.js";
+import { EvalAttemptTrace, evalBraintrustConfig, exportBraintrustAttemptParent, finalizeEvalAttemptTrace } from "./braintrust.js";
 import { RunnerApi } from "./api.js";
 import { buildPaperclipServerEnvironment } from "./harness-env.js";
 import { setupLiveFixtures } from "./live-fixtures.js";
@@ -145,4 +145,49 @@ it("never sends sensitive PUT bodies through Playwright and refuses redirects or
   await expect(api.putSensitive("https://other.invalid/api/collect", { apiKey: config.apiKey })).rejects.toThrow("fixture API");
   transport.mockRejectedValue(new Error(config.apiKey));
   await expect(api.putSensitive("/api/fixture", {})).rejects.toThrow("details withheld");
+});
+
+it.each([
+  { status: "failed", cleanup: "passed", failureClass: "permanent_infrastructure" },
+  { status: "failed", cleanup: "failed", failureClass: "cleanup_failure" },
+] as const)("updates a passing worker trace with the supervisor's $failureClass outcome", async outcome => {
+  const root = protobuf.parse(await readFile(new URL("../../server/src/__tests__/fixtures/otlp-observability.proto", import.meta.url), "utf8")).root;
+  const trace = new EvalAttemptTrace(config, identity, provenance);
+  const original = await trace.export(input, async () => new Response(null, { status: 200 }));
+  const saved = structuredClone(original);
+  let captured: RequestInit | undefined;
+  const finalization = await finalizeEvalAttemptTrace(config, { receipt: original, identity, provenance,
+    result: { startedAt: new Date(Date.now() - 10_000).toISOString(), ...outcome, runIds: [companyId] },
+  }, async (_url, init) => { captured = init; return new Response(null, { status: 200 }); });
+  expect(finalization).toMatchObject({ status: "accepted", outcome: "failed", verification: "unverified" });
+  expect(original).toEqual(saved);
+  const decoded = root.lookupType("paperclip.test.otlp.ExportTraceServiceRequest").decode(captured!.body as Buffer).toJSON();
+  const spans = decoded.resourceSpans[0].scopeSpans[0].spans;
+  expect(spans.map((span: { name: string }) => span.name)).toEqual(["paperclip.eval.attempt", "paperclip.eval.finalization"]);
+  expect(Buffer.from(spans[0].traceId, "base64").toString("hex")).toBe(original.traceId);
+  expect(Buffer.from(spans[0].spanId, "base64").toString("hex")).toBe(original.spanId);
+  expect(spans[1].parentSpanId).toBe(spans[0].spanId);
+  expect(spans.every((span: { status: { code: number } }) => span.status.code === 2)).toBe(true);
+  const attributes = Object.fromEntries(spans[0].attributes.map((attribute: { key: string; value: { stringValue: string } }) => [attribute.key, attribute.value.stringValue]));
+  expect(attributes).toMatchObject({ "paperclip.eval.outcome_stage": "supervisor", "paperclip.eval.outcome": "failed",
+    "paperclip.eval.failure_class": outcome.failureClass, "paperclip.eval.source_revision": provenance.sourceRevision });
+  expect(JSON.stringify(decoded)).not.toMatch(/private-ingestion|gen_ai\.usage|cost_usd/);
+});
+
+it("retains finalization export failures without changing the recorded product result", async () => {
+  const trace = new EvalAttemptTrace(config, identity, provenance);
+  const result = { startedAt: new Date().toISOString(), status: "passed" as const, cleanup: "passed" as const };
+  const saved = structuredClone(result);
+  const receipt = await finalizeEvalAttemptTrace(config, { receipt: trace.snapshot(), identity, provenance, result }, async () => new Response("private-error", { status: 503 }));
+  expect(receipt).toMatchObject({ status: "failed", outcome: "passed", errorCode: "receiver_rejected", httpStatus: 503 });
+  expect(result).toEqual(saved);
+  expect(JSON.stringify(receipt)).not.toMatch(/private-error|private-ingestion/);
+  const transport = vi.fn<typeof fetch>();
+  expect(await finalizeEvalAttemptTrace(config, { receipt: { ...trace.snapshot(), projectId: companyId }, identity, provenance, result }, transport))
+    .toMatchObject({ status: "failed", errorCode: "invalid_finalization_context" });
+  expect(transport).not.toHaveBeenCalled();
+  expect(await finalizeEvalAttemptTrace(config, { receipt: trace.snapshot(), identity, provenance,
+    result: { ...result, failureClass: "private-target-output" as never },
+  }, transport)).toMatchObject({ status: "failed", errorCode: "invalid_finalization_context" });
+  expect(transport).not.toHaveBeenCalled();
 });
