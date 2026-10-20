@@ -441,3 +441,10 @@ not overwrite earlier evidence with a partially written JSON file.
 Review counts and fingerprints advance only after a checkpoint succeeds. A later
 write failure or expired deadline retains the last saved bodies and marks coverage
 incomplete.
+
+Braintrust export requires an explicit eval project UUID. Native capture includes
+prompts, responses, and tool content only after that opt-in configures the isolated
+company's observability destination. The ingestion key crosses the public API via
+Node fetch, outside Playwright tracing, and is included in launcher evidence
+redaction. Orchestration spans contain identifiers, phase timing, outcome, and
+feedback counts; they never contain provider credentials or feedback bodies.
