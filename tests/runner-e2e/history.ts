@@ -2,6 +2,7 @@ import { isIncompleteFirstTaskResult } from "./case-outcome.js";
 import { buildCampaignAccounting } from "./attempt-accounting.js";
 import { validateEvalOperationsReport } from "./operations-report.js";
 import { validateCampaignFeedbackReview } from "./feedback-dispositions.js";
+import { validateBraintrustExperimentReceipt } from "./braintrust-experiment.js";
 import { summarizeStartupReuse } from "../../packages/adapter-utils/src/startup-reuse.js";
 import { validateCampaignAccounting, validateRetainedRunnerResult } from "./result-validation.js";
 import {
@@ -73,6 +74,7 @@ export function buildRunnerCampaign(input: {
   accounting?: RunnerE2ECampaignAccounting;
   operations?: RunnerE2ECampaign["operations"];
   feedbackReview?: RunnerE2ECampaign["feedbackReview"];
+  braintrustExperiment?: RunnerE2ECampaign["braintrustExperiment"];
   excludedArtifacts?: number;
   eventName?: string | null;
   catalog?: readonly ReportExecution[];
@@ -224,10 +226,12 @@ export function buildRunnerCampaign(input: {
     accounting,
     ...(input.operations ? { operations: input.operations } : {}),
     ...(input.feedbackReview ? { feedbackReview: input.feedbackReview } : {}),
+    ...(input.braintrustExperiment ? { braintrustExperiment: input.braintrustExperiment } : {}),
     suites,
     results,
   };
   if (campaign.feedbackReview) validateCampaignFeedbackReview(campaign, campaign.feedbackReview);
+  if (campaign.braintrustExperiment) validateBraintrustExperimentReceipt(campaign, campaign.braintrustExperiment);
   return campaign;
 }
 

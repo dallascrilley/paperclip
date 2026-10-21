@@ -1,5 +1,9 @@
 import { expect, it, vi } from "vitest";
-import { buildBraintrustExperiment, importBraintrustExperiment, type BraintrustExperimentReceipt } from "./braintrust-experiment.js";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { buildBraintrustExperiment, importBraintrustExperiment, renderBraintrustExperiment, type BraintrustExperimentReceipt } from "./braintrust-experiment.js";
+import { regenerateRunnerDashboard } from "./dashboard-regenerate.js";
 import { buildRunnerCampaign } from "./history.js";
 import { runnerMatrix } from "./catalog.js";
 import { emptyFeedbackSummary } from "./feedback.js";
@@ -84,6 +88,8 @@ function receiver(campaign: ReturnType<typeof fixture>["campaign"], originals: R
   return vi.fn<typeof fetch>(async (url, init) => {
     expect(String(url).startsWith("https://api.braintrust.dev/v1/")).toBe(true);
     expect(init?.redirect).toBe("error");
+    if (String(url).endsWith("/summarize")) return Response.json({ experiment_name: plan.name,
+      project_url: "https://www.braintrust.dev/app/Example/p/Evals", experiment_url: `https://www.braintrust.dev/app/Example/p/Evals/experiments/${plan.name}` });
     const sent = JSON.parse(String(init?.body));
     if (String(url).endsWith("/experiment")) {
       expect(sent).toMatchObject({ public: false, ensure_new: false, project_id: projectId, name: plan.name });
@@ -98,11 +104,28 @@ it("retries identical evidence using the same private experiment and stable row 
   const transport = receiver(campaign, originals), receipts: BraintrustExperimentReceipt[] = [];
   for (let i = 0; i < 2; i++) await importBraintrustExperiment({ projectId, apiKey: "private-key" }, campaign, originals,
     async receipt => { receipts.push(receipt); }, transport);
-  expect(receipts.map(receipt => receipt.status)).toEqual(["created", "accepted", "created", "accepted"]);
-  expect(receipts[1]).toEqual(receipts[3]);
+  expect(receipts.map(receipt => receipt.status)).toEqual(["created", "accepted", "accepted", "created", "accepted", "accepted"]);
+  expect(receipts[2]).toEqual(receipts[5]);
   expect(receipts[1]).toMatchObject({ acceptedRows: 2, expectedRows: 2, verification: "unverified" });
-  expect(transport.mock.calls[0]![1]!.body).toBe(transport.mock.calls[2]![1]!.body);
-  expect(transport.mock.calls[1]![1]!.body).toBe(transport.mock.calls[3]![1]!.body);
+  expect(transport.mock.calls[0]![1]!.body).toBe(transport.mock.calls[3]![1]!.body);
+  expect(transport.mock.calls[1]![1]!.body).toBe(transport.mock.calls[4]![1]!.body);
+});
+
+it("preserves an evidence-bound experiment link through report regeneration and rejects stale or unsafe links", async () => {
+  const { campaign, originals } = fixture();
+  const receipt = await importBraintrustExperiment({ projectId, apiKey: "key" }, campaign, originals, async () => {}, receiver(campaign, originals));
+  campaign.braintrustExperiment = receipt;
+  const root = await mkdtemp(path.join(tmpdir(), "experiment-report-"));
+  try {
+    await writeFile(path.join(root, "normalized-results.json"), JSON.stringify(campaign));
+    await regenerateRunnerDashboard({ bundle: root, historyFile: null });
+    expect(JSON.parse(await readFile(path.join(root, "normalized-results.json"), "utf8")).braintrustExperiment).toEqual(receipt);
+    expect(await readFile(path.join(root, "dashboard.html"), "utf8")).toContain(receipt.experimentUrl);
+    expect(() => renderBraintrustExperiment({ ...campaign, braintrustExperiment: { ...receipt, experimentUrl: "https://untrusted.example/app/secret" } })).toThrow();
+    expect(() => renderBraintrustExperiment({ ...campaign, braintrustExperiment: { ...receipt, privateNote: "private-canary" } as never })).toThrow();
+    campaign.accounting!.missingAttempts++;
+    expect(() => renderBraintrustExperiment(campaign)).toThrow();
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 it("checkpoints accepted batches before a later insert fails", async () => {

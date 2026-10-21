@@ -29,6 +29,7 @@ interface PublishedCampaign {
   accounting?: RunnerE2ECampaign["accounting"];
   operations?: RunnerE2ECampaign["operations"];
   feedbackReview?: RunnerE2ECampaign["feedbackReview"];
+  braintrustExperiment?: RunnerE2ECampaign["braintrustExperiment"];
 }
 
 async function relativeFiles(root: string, current = root): Promise<string[]> {
@@ -100,6 +101,7 @@ export async function regenerateRunnerDashboard(input: {
     results,
     accounting: normalized.accounting,
     operations: normalized.operations,
+    braintrustExperiment: normalized.braintrustExperiment,
     feedbackReview: input.feedbackReviewFile
       ? JSON.parse(await readFile(input.feedbackReviewFile, "utf8"))
       : normalized.feedbackReview,

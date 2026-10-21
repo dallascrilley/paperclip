@@ -317,6 +317,7 @@ async function main() {
     excludedArtifacts: excludedArtifacts + retained.excludedArtifacts,
     ...(process.env.PAPERCLIP_E2E_OPERATIONS_LEDGER ? { operations: await readEvalOperationsReport(process.env.PAPERCLIP_E2E_OPERATIONS_LEDGER) } : {}),
     ...(process.env.PAPERCLIP_E2E_FEEDBACK_REVIEW ? { feedbackReview: JSON.parse(await readFile(process.env.PAPERCLIP_E2E_FEEDBACK_REVIEW, "utf8")) } : {}),
+    ...(process.env.PAPERCLIP_E2E_BRAINTRUST_EXPERIMENT ? { braintrustExperiment: JSON.parse(await readFile(process.env.PAPERCLIP_E2E_BRAINTRUST_EXPERIMENT, "utf8")) } : {}),
   });
   const billing = campaign.billing;
   const feedback = summarizeCampaignFeedback(campaign.accounting?.attempts ?? campaign.results);

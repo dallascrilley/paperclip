@@ -3,7 +3,7 @@ import { buildCampaignAccounting } from "./attempt-accounting.js";
 import { exportBraintrustAttemptParent, type EvalBraintrustConfig } from "./braintrust.js";
 import { validateCampaignFeedbackReview } from "./feedback-dispositions.js";
 import { validateEvalOperationsReport } from "./operations-report.js";
-import { isPublicReportTimestamp } from "./report-format.js";
+import { html, isPublicReportTimestamp } from "./report-format.js";
 import type { RunnerE2ECampaign, RunnerE2EResult } from "./types.js";
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -96,12 +96,50 @@ export function buildBraintrustExperiment(projectId: string, campaign: RunnerE2E
 export interface BraintrustExperimentReceipt {
   version: 1; projectId: string; experimentId: string; name: string; payloadHash: string;
   status: "created" | "accepted"; acceptedRows: number; expectedRows: number; verification: "unverified";
+  evidenceHash: string; projectUrl?: string; experimentUrl?: string;
 }
 
-async function post(config: EvalBraintrustConfig, endpoint: string, payload: unknown, transport: typeof fetch) {
+export function experimentEvidenceHash(campaign: RunnerE2ECampaign) {
+  return digest({ campaignId: campaign.campaignId, expected: [...campaign.expected].sort(),
+    accounting: campaign.accounting, operations: campaign.operations ?? null, feedbackReview: campaign.feedbackReview ?? null });
+}
+
+function safeBraintrustUrl(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && ["braintrust.dev", "www.braintrust.dev"].includes(url.host)
+      && !url.username && !url.password && !url.search && !url.hash && url.pathname.startsWith("/app/");
+  } catch { return false; }
+}
+
+export function validateBraintrustExperimentReceipt(campaign: RunnerE2ECampaign, receipt: BraintrustExperimentReceipt): void {
+  if (!receipt || Object.keys(receipt).some(key => !["version", "projectId", "experimentId", "name", "payloadHash", "status", "acceptedRows", "expectedRows", "verification", "evidenceHash", "projectUrl", "experimentUrl"].includes(key))
+      || receipt.version !== 1 || !uuid.test(receipt.projectId) || !uuid.test(receipt.experimentId)
+      || receipt.evidenceHash !== experimentEvidenceHash(campaign) || !/^[a-f0-9]{64}$/.test(receipt.payloadHash)
+      || receipt.name !== `${campaign.campaignId}-${receipt.payloadHash}` || !["created", "accepted"].includes(receipt.status)
+      || !count(receipt.acceptedRows) || receipt.expectedRows !== campaign.accounting?.attempts.length
+      || receipt.acceptedRows > receipt.expectedRows || receipt.verification !== "unverified"
+      || receipt.status === "accepted" && receipt.acceptedRows !== receipt.expectedRows
+      || receipt.experimentUrl !== undefined && !safeBraintrustUrl(receipt.experimentUrl)
+      || receipt.projectUrl !== undefined && !safeBraintrustUrl(receipt.projectUrl)) invalid();
+}
+
+export function renderBraintrustExperiment(campaign: RunnerE2ECampaign): string {
+  const receipt = campaign.braintrustExperiment;
+  if (!receipt) return "";
+  validateBraintrustExperimentReceipt(campaign, receipt);
+  return `<section aria-label="Braintrust experiment"><h2>Braintrust experiment</h2><p>${receipt.experimentUrl
+    ? `<a href="${html(receipt.experimentUrl)}">Open retained attempt scores in Braintrust</a>`
+    : `Experiment ${html(receipt.experimentId)}`}. ${receipt.acceptedRows}/${receipt.expectedRows} rows accepted.
+    Original product and cleanup grades are separate. Indexing requires independent verification; no agents were rerun for this import.</p></section>`;
+}
+
+async function request(config: EvalBraintrustConfig, endpoint: string, payload: unknown, transport: typeof fetch) {
   const response = await transport(`https://api.braintrust.dev/v1/${endpoint}`, {
-    method: "POST", redirect: "error", signal: AbortSignal.timeout(15_000),
-    headers: { authorization: `Bearer ${config.apiKey}`, "content-type": "application/json" }, body: JSON.stringify(payload),
+    method: payload === undefined ? "GET" : "POST", redirect: "error", signal: AbortSignal.timeout(15_000),
+    headers: { authorization: `Bearer ${config.apiKey}`, "content-type": "application/json" },
+    ...(payload === undefined ? {} : { body: JSON.stringify(payload) }),
   });
   const reader = response.body?.getReader(), chunks: Uint8Array[] = []; let size = 0;
   try {
@@ -120,21 +158,29 @@ export async function importBraintrustExperiment(config: EvalBraintrustConfig, c
   const plan = buildBraintrustExperiment(config.projectId, campaign, originals);
   if (!config.apiKey?.trim() || /[\r\n]/.test(config.apiKey)) throw new Error("Missing Braintrust ingestion credential");
   try {
-    const created = await post(config, "experiment", { project_id: plan.projectId, name: plan.name,
+    const created = await request(config, "experiment", { project_id: plan.projectId, name: plan.name,
       public: false, ensure_new: false, metadata: plan.metadata }, transport);
     if (!uuid.test(String(created?.id)) || created.project_id !== plan.projectId || created.name !== plan.name || created.public !== false
         || (created.metadata as Record<string, unknown> | undefined)?.payload_hash !== plan.payloadHash) throw new Error("conflicting_experiment");
     const receipt: BraintrustExperimentReceipt = { version: 1, projectId: plan.projectId, experimentId: String(created.id),
-      name: plan.name, payloadHash: plan.payloadHash, status: "created", acceptedRows: 0, expectedRows: plan.events.length, verification: "unverified" };
+      name: plan.name, payloadHash: plan.payloadHash, evidenceHash: experimentEvidenceHash(campaign),
+      status: "created", acceptedRows: 0, expectedRows: plan.events.length, verification: "unverified" };
     await persist({ ...receipt });
     for (let offset = 0; offset < plan.events.length; offset += 100) {
       const events = plan.events.slice(offset, offset + 100);
-      const inserted = await post(config, `experiment/${receipt.experimentId}/insert`, { events }, transport);
+      const inserted = await request(config, `experiment/${receipt.experimentId}/insert`, { events }, transport);
       if (!Array.isArray(inserted?.row_ids) || JSON.stringify([...inserted.row_ids].sort()) !== JSON.stringify(events.map(event => event.id).sort())) throw new Error("missing_rows");
       receipt.acceptedRows += events.length;
       if (receipt.acceptedRows === receipt.expectedRows) receipt.status = "accepted";
       await persist({ ...receipt });
     }
+    try {
+      const summary = await request(config, `experiment/${receipt.experimentId}/summarize`, undefined, transport);
+      if (summary.experiment_name === plan.name && safeBraintrustUrl(summary.project_url) && safeBraintrustUrl(summary.experiment_url)) {
+        receipt.projectUrl = summary.project_url; receipt.experimentUrl = summary.experiment_url;
+        await persist({ ...receipt });
+      }
+    } catch {}
     return receipt;
   } catch { throw new Error("Braintrust experiment import incomplete; retain the receipt and retry identical evidence. Remote details withheld."); }
 }

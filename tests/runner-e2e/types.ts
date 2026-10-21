@@ -446,6 +446,7 @@ export interface RunnerE2ECampaign {
   accounting?: RunnerE2ECampaignAccounting;
   operations?: import("./operations-report.js").EvalOperationsReport;
   feedbackReview?: import("./feedback-dispositions.js").CampaignFeedbackReview;
+  braintrustExperiment?: import("./braintrust-experiment.js").BraintrustExperimentReceipt;
   suites: RunnerE2ESuiteSummary[];
   results: RunnerE2EResult[];
 }
