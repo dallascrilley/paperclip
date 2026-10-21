@@ -115,7 +115,7 @@ the selected result's revision must not be assigned to older attempts.
 
 ```sh
 PAPERCLIP_E2E_BRAINTRUST_PROJECT_ID=PROJECT_UUID \
-pnpm exec tsx tests/runner-e2e/braintrust-experiment-import.ts \
+node cli/node_modules/tsx/dist/cli.mjs tests/runner-e2e/braintrust-experiment-import.ts \
   /private/campaign/normalized-results.json /private/campaign/original-result-paths.json \
   /private/campaign/experiment-plan.json --dry-run
 ```
