@@ -1,6 +1,6 @@
 import { readEvalCostLedger, validEvalLedgerId } from "./cost-ledger.js";
 import { usdToUnits } from "../../packages/shared/src/money.js";
-import { html } from "./report-format.js";
+import { html, isPublicReportTimestamp } from "./report-format.js";
 
 const money = (n: bigint) => `${n / 1_000_000_000n}.${String(n % 1_000_000_000n).padStart(9, "0")}`;
 interface EvalOperationsAvailableReport {
@@ -40,7 +40,7 @@ export function validateEvalOperationsReport(report: EvalOperationsReport): void
   const count = (value: unknown) => { if (!Number.isSafeInteger(value) || Number(value) < 0) fail(); };
   fields(report, ["version", "scope", "ledgerCampaignId", "journalHash", "records", "deadlineAt", "limitUsd", "knownUsd", "heldUsd", "committedUsd", "requests", "unresolvedRequests", "conflictingRequests", "inflight", "breakdown", "attempts"]);
   if (report.version !== 1 || report.scope !== "shared_gateway_ledger" || !validEvalLedgerId(report.ledgerCampaignId)
-      || !/^[a-f0-9]{64}$/.test(report.journalHash) || !Number.isFinite(Date.parse(report.deadlineAt)) || !Array.isArray(report.attempts)) fail();
+      || !/^[a-f0-9]{64}$/.test(report.journalHash) || !isPublicReportTimestamp(report.deadlineAt) || !Array.isArray(report.attempts)) fail();
   [report.records, report.requests, report.unresolvedRequests, report.conflictingRequests, report.inflight].forEach(count);
   if (report.records < 1 || report.unresolvedRequests > report.requests || report.conflictingRequests > report.unresolvedRequests || report.inflight > report.requests) fail();
   dollars(report.limitUsd);
@@ -81,11 +81,13 @@ async function readAvailableEvalOperationsReport(file: string): Promise<EvalOper
     group.heldUsd = money(usdToUnits(group.heldUsd) + held);
     groups.set(key, group);
   }
-  return { version: 1, scope: "shared_gateway_ledger", ledgerCampaignId: snapshot.campaignId,
-    journalHash: loaded.previous, records: loaded.sequence, deadlineAt: loaded.state.limits.deadlineAt,
+  const report: EvalOperationsAvailableReport = { version: 1, scope: "shared_gateway_ledger", ledgerCampaignId: snapshot.campaignId,
+    journalHash: loaded.previous, records: loaded.sequence, deadlineAt: new Date(loaded.state.limits.deadlineAt).toISOString(),
     limitUsd: snapshot.limitUsd, knownUsd: snapshot.knownUsd, heldUsd: snapshot.heldUsd, committedUsd: snapshot.committedUsd,
     requests: snapshot.requests.length, unresolvedRequests: snapshot.unknownRequests, conflictingRequests: snapshot.conflictingRequests,
     inflight: snapshot.inflight, breakdown: snapshot.breakdown as EvalOperationsAvailableReport["breakdown"], attempts: [...groups.values()] };
+  validateEvalOperationsReport(report);
+  return report;
 }
 
 export function operationsReportText(report: EvalOperationsReport): string[] {

@@ -40,6 +40,19 @@ it("reports shared setup/retry spending once, preserves unknown holds and omits 
     expect(() => validateEvalOperationsReport({ ...report, secret: "forbidden" } as never)).toThrow("Invalid retained");
     expect(() => validateEvalOperationsReport({ ...report, knownUsd: "0.060000000" })).toThrow("Invalid retained");
     expect(() => validateEvalOperationsReport({ ...report, attempts: [] })).toThrow("Invalid retained");
+    expect(() => validateEvalOperationsReport({ ...report, deadlineAt: "Tue, 20 Oct 2026 01:00:00 GMT (private note)" })).toThrow("Invalid retained");
+  } finally { await ledger.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+it("publishes the parsed deadline without private text accepted by the journal's date parser", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "eval-operations-report-")), file = path.join(root, "ledger.jsonl");
+  const deadlineAt = "Thu, 01 Jan 2099 00:00:00 GMT (private budget rationale)";
+  const ledger = await openEvalCostLedger(file, { campaignId: "pilot", maxUsd: "1", deadlineAt, maxRequests: 10, maxConcurrent: 2 });
+  try {
+    const report = await readEvalOperationsReport(file);
+    expect(report).toMatchObject({ deadlineAt: "2099-01-01T00:00:00.000Z" });
+    expect(JSON.stringify(report)).not.toContain("private budget rationale");
+    expect(await readFile(file, "utf8")).toContain(deadlineAt);
   } finally { await ledger.close(); await rm(root, { recursive: true, force: true }); }
 });
 
