@@ -31,6 +31,7 @@ function managedEnv(raw: string | undefined = MANAGED_RAW) {
 function stubDb(row: Record<string, unknown>) {
   const persistedSets: Array<Record<string, unknown>> = [];
   const db = {
+    transaction: (fn: (tx: Db) => Promise<unknown>) => fn(db),
     select: () => ({ from: () => ({ where: () => Promise.resolve([row]) }) }),
     insert: () => {
       throw new Error("unexpected insert in test");

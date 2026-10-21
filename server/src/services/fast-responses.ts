@@ -1,3 +1,4 @@
+import { insertIssueComment } from "./issue-comment-writes.js";
 import { randomUUID } from "node:crypto";
 import { sanitizeQuarantinedCommentForHigherTrust } from "./source-trust.js";
 import {
@@ -1011,21 +1012,18 @@ export function fastResponseService(
                   ),
                 )
             : [];
-          const [comment] = await tx
-            .insert(issueComments)
-            .values({
-              companyId: request.companyId,
-              issueId: request.issueId!,
-              authorAgentId: request.agentId,
-              authorUserId: request.agentId ? null : "board-concierge",
-              authorType: request.agentId ? "agent" : "system",
-              body: safe.text,
-              sourceTrust: source?.sourceTrust ?? null,
-              conversationSessionGeneration: request.sessionGeneration,
-              origin: "fast_response",
-              fastResponseRequestId: request.id,
-            })
-            .returning();
+          const [comment] = await insertIssueComment(tx, {
+            companyId: request.companyId,
+            issueId: request.issueId!,
+            authorAgentId: request.agentId,
+            authorUserId: request.agentId ? null : "board-concierge",
+            authorType: request.agentId ? "agent" : "system",
+            body: safe.text,
+            sourceTrust: source?.sourceTrust ?? null,
+            conversationSessionGeneration: request.sessionGeneration,
+            origin: "fast_response",
+            fastResponseRequestId: request.id,
+          });
           if (
             request.endpointId &&
             request.conversationId &&
