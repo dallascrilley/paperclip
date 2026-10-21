@@ -769,7 +769,7 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: HeartbeatRunRow
     const projected = await issueService(tx).update(issue.id, { status: "blocked" }, tx);
     if (projected) {
       nativeFailureBlock = { runId: run.id, statusVersion: projected.statusVersion };
-      await notifyDeliveryWork(tx, DELIVERY_QUEUES.mcpEvents);
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.mcpEvents, "*");
       await tx.insert(activityLog).values({
         companyId: issue.companyId, actorType: "system", actorId: "execution-recovery",
         action: "issue.updated", entityType: "issue", entityId: issue.id, runId: run.id,

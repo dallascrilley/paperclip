@@ -6,7 +6,7 @@ type WriteDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 export function insertIssueComment(db: WriteDb, input: PgInsertValue<typeof issueComments>) {
   return db.transaction(async tx => {
-    await notifyDeliveryWork(tx, DELIVERY_QUEUES.dotEvents);
+    await notifyDeliveryWork(tx, DELIVERY_QUEUES.dotEvents, "*");
     return tx.insert(issueComments).values(input).returning();
   });
 }

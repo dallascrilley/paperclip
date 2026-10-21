@@ -651,7 +651,7 @@ export function activityService(db: Db) {
     },
 
     create: (data: typeof activityLog.$inferInsert) => db.transaction(async tx => {
-      if (data.entityType === "issue") await notifyDeliveryWork(tx, DELIVERY_QUEUES.mcpEvents);
+      if (data.entityType === "issue") await notifyDeliveryWork(tx, DELIVERY_QUEUES.mcpEvents, "*");
       const [row] = await tx.insert(activityLog).values(data).returning();
       return row;
     }),

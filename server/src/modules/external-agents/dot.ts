@@ -178,7 +178,7 @@ function createBroker(db: Db) {
         for (const { assignment } of terminal) {
           await tx.update(assignments).set({ status: "fenced" }).where(eq(assignments.id, assignment.id));
           if (binding.providerKind === "grok_bot") await tx.update(grokBotRoutines).set({ recoveryRequiredAt: new Date(), recoveryReason: "work_session", updatedAt: new Date() }).where(eq(grokBotRoutines.bindingId, binding.id));
-          await notifyDeliveryWork(tx, DELIVERY_QUEUES.dotEvents);
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.dotEvents, "*");
           await tx.insert(mailbox).values({ companyId, bindingId, bindingGeneration: binding.generation,
             assignmentId: assignment.id, kind: "authority_revoked", sourceEventId: randomUUID(),
             references: { assignmentId: assignment.id, runId: assignment.runId, externalStopConfirmed: false } });
@@ -467,7 +467,7 @@ function createBroker(db: Db) {
           throw fail("The event subscription is no longer verified.");
         }
         await tx.update(bindings).set({ challengeHash: hash(nonce), challengeExpiresAt: new Date(Date.now() + 10 * 60_000), updatedAt: new Date() }).where(eq(bindings.id, b.id));
-        await notifyDeliveryWork(tx, DELIVERY_QUEUES.dotEvents);
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.dotEvents, "*");
         await tx.insert(mailbox).values({ companyId, bindingId: b.id, bindingGeneration: b.generation,
           kind: "readiness_challenge", sourceEventId: "challenge_" + randomUUID(), references: { challenge: nonce } });
         await logActivity(tx as unknown as Db, { companyId, actorType: "user", actorId: b.operatorId,

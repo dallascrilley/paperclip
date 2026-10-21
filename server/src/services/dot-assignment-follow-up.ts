@@ -33,7 +33,7 @@ export async function publishActiveDotComment(db: Db, input: {
       gt(dotRunnerAssignments.expiresAt, new Date()))).limit(1);
   if (!assignment) return false;
   // Same key as the event scanner: either path may discover the comment first.
-  await notifyDeliveryWork(db, DELIVERY_QUEUES.dotEvents);
+  await notifyDeliveryWork(db, DELIVERY_QUEUES.dotEvents, "*");
   await db.insert(dotMailboxItems).values({ companyId: input.companyId, bindingId: binding.id,
     bindingGeneration: binding.generation, assignmentId: assignment.id, kind: "follow_up",
     sourceEventId: `dot-follow-up:${assignment.id}:${input.commentId}`,
@@ -91,7 +91,7 @@ export async function consumeDotHistoryReceipt(db: Db, operation: typeof dotRunn
     if (!comments.length) return;
     // Materialize consumption even if the comment wake has not yet been admitted.
     // Admission, event scanning and receipt reads all serialize on this binding.
-    await notifyDeliveryWork(tx, DELIVERY_QUEUES.dotEvents);
+    await notifyDeliveryWork(tx, DELIVERY_QUEUES.dotEvents, "*");
     for (const comment of comments) await tx.insert(dotMailboxItems).values({
       companyId: source.companyId, bindingId: binding.id, bindingGeneration: binding.generation,
       assignmentId: source.id, kind: "follow_up", sourceEventId: `dot-follow-up:${source.id}:${comment.id}`,

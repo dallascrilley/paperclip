@@ -184,6 +184,22 @@ describe.skipIf(!support.supported)("MCP event committed work", () => {
     await second.start(); await activity(); await delivered(25); await quiet();
   });
 
+  it("scopes subscription refreshes and does not rescan sources on delivery retries", async () => {
+    const first = await fixture(); const firstSubscription = await first.subscribe();
+    const second = await fixture(); const secondSubscription = await second.subscribe(); await second.start();
+    const untouched = new Date(0);
+    await db.update(mcpEventSubscriptions).set({ scannedAt: untouched });
+    await second.subscribe(); await settle();
+    const subscriptions = await db.select().from(mcpEventSubscriptions);
+    expect(subscriptions.find(s => s.id === firstSubscription.id)?.scannedAt).toEqual(untouched);
+    expect(subscriptions.find(s => s.id === secondSubscription.id)?.scannedAt.getTime()).toBeGreaterThan(0);
+    status = 503; await activity(); await delivered(2);
+    await db.update(mcpEventSubscriptions).set({ scannedAt: untouched });
+    status = 204; await vi.advanceTimersByTimeAsync(4_000); await delivered(4);
+    expect((await db.select().from(mcpEventSubscriptions)).every(s => s.scannedAt.getTime() === 0)).toBe(true);
+    await quiet();
+  });
+
   it("keeps changes arriving during delivery and waits for in-flight shutdown", async () => {
     const f = await fixture(); await f.subscribe(); await f.start();
     duringDelivery = async () => { await activity(); };
@@ -206,6 +222,22 @@ describe.skipIf(!support.supported)("MCP event committed work", () => {
     await quiet(11 * 60_000);
     await dotRunnerBroker(db).challenge(companyId, f.agentId); await delivered(2); await quiet();
     expect(coordinator.nextWakeAt()).toBeNull();
+  });
+
+  it("scopes Dot reconnect scans to the binding and delivers to all its subscriptions", async () => {
+    const f = await fixture(true); await f.subscribe(); await f.start(); await delivered(1);
+    const [challenge] = await db.select().from(dotMailboxItems);
+    await dotRunnerBroker(db).confirmChallenge(f.principal, String(challenge.references.challenge));
+    await service.subscribe(f.principal, { ...f.input, delivery: { ...f.input.delivery, url: "https://receiver.example/second" } });
+    await settle();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: f.agentId, invocationSource: "assignment", status: "queued" }).returning();
+    await db.insert(dotRunnerAssignments).values({ companyId, agentId: f.agentId, bindingId: f.bindingId, bindingGeneration: 1,
+      runId: run.id, normalizedSessionId: randomUUID(), turnId: randomUUID(), controllerGeneration: 1, catalogDigest: "test", status: "offered", projection: {},
+      acceptBy: new Date(Date.now() + 600_000), expiresAt: new Date(Date.now() + 3600_000) });
+    await quiet();
+    await f.subscribe(); await delivered(3);
+    expect(received.slice(1).map(event => event.data.kind)).toEqual(["assignment", "assignment"]);
+    await quiet();
   });
 
   it("wakes for a native broker authority fence without another comment or subscription write", async () => {

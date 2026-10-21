@@ -606,8 +606,8 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
       }
       const now = new Date();
       const [updated] = await db.transaction(async tx => {
-        await notifyDeliveryWork(tx, DELIVERY_QUEUES.mcpEvents);
-        await notifyDeliveryWork(tx, DELIVERY_QUEUES.dotEvents);
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.mcpEvents, "*");
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.dotEvents, "*");
         return tx
           .update(instanceSettings)
           .set({

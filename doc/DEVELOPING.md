@@ -3144,8 +3144,11 @@ including when delivery history remains in the database.
 | Admission and old subscription cleanup | Opportunistic on startup and subsequent enabled sweeps; expiry remains enforced on use |
 
 The scanner preserves durable delivery receipts instead of advancing a timestamp
-cursor that could skip a late commit. Full source/delivery batches schedule another
-sweep until caught up. A fresh request or failed sweep survives warm standby and
+cursor that could skip a late commit. Subscription scans use pages of 20; full source/delivery batches schedule another
+sweep until caught up. Subscription creation, refresh, and removal target their
+subscription ID (or the shared Dot binding for reconnect mailbox entries). Delivery retries do not rescan unchanged subscriptions. Broad
+source-change notifications retain an explicit wildcard when a transaction also
+contains scoped hints. A fresh request or failed sweep survives warm standby and
 idle drain; skipped dispatch never marks it complete. Shutdown stops admission of
 new batches and waits for the current bounded webhook attempt to settle.
 
