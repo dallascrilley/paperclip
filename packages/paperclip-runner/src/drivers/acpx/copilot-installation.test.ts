@@ -89,7 +89,7 @@ describe("Copilot build-owned installation", () => {
   it("admits the current profile with environment launch preparation", () => {
     expect(QUALIFIED_ACPX_PROFILES.copilot.agentProfileVersion).toBe(52);
     expect(QUALIFIED_ACPX_PROFILES.copilot.qualificationStatus).toBeUndefined();
-    expect(QUALIFIED_ACPX_PROFILES.copilot.commandDigest).toBe("sha256:75c8a162fba32e2f7f5f4129a92063ecf67203883be9880b910f25c9d3af937b");
+    expect(QUALIFIED_ACPX_PROFILES.copilot.commandDigest).toBe("sha256:3614db52d3ddcbc0153c79361a0db2c4324249475d3be490f152b64f916bdd53");
   });
 
   it("preserves v51 when the setup transport contract changes", () => {
