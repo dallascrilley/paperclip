@@ -137,9 +137,10 @@ Resuming the same journal requires exactly the original limits. A dead process
 can leave a lock and held reservations; inspect the owner and upstream receipts
 before recovering it. Never delete a live writer's lock or reset a ledger merely
 to regain budget. Older journals without an attempt cap remain readable for
-reporting and reconciliation. Operations refuses to resume them under the new
-limits because their zero-request attempts cannot be reconstructed from request
-receipts. Do not replace or reset an active pilot ledger to evade this check.
+reporting and reconciliation. Operations refuses an implicit upgrade because request receipts cannot reconstruct
+zero-request attempts. Use the explicit audited migration below only after
+reviewing all retained campaign attempts. Do not replace or reset an active pilot
+ledger to evade this check.
 
 No recurring schedule is enabled by this integration. Qualification of actual
 agent streams, tools, continuation, cancellation, native traces, and remote routes
@@ -165,3 +166,35 @@ fsynced journal after the worker exits. This boundary applies to the admitted
 local core cells; it does not establish coverage for separate judges, paid tools,
 child-agent attribution, or remote routes. Historical journals retain their
 original attribution and are not retroactively rewritten.
+
+### Auditing a legacy journal before adding an attempt cap
+
+A journal created before durable attempt admission can acquire one attempt policy
+through `ledger-attempt-policy.ts`. Stop its launcher and gateway first. Review
+all retained campaigns, including startup failures with no model request. Save
+the review and its source references as a private evidence file. Each prior
+attempt needs its original execution and accounting attempt ID; request receipts
+alone are insufficient. If that history is incomplete, do not resume paid work.
+
+Create a private JSON audit with these fields:
+
+- `version`: `1`.
+- `ledgerPath` and `evidencePath`: absolute private file paths.
+- `previousJournalHash`: the current journal's final record hash.
+- `evidenceSha256`: SHA-256 of the reviewed evidence file.
+- `maxAttemptsPerExecution`: the finite cap to adopt, including past attempts.
+- `priorAttempts`: an array of `{ "executionId": "...", "attemptId": "..." }`.
+
+Run `pnpm exec tsx tests/runner-e2e/ledger-attempt-policy.ts /absolute/private-audit.json`.
+The command checks evidence and journal hashes, takes the normal exclusive writer
+lock, and appends one fsynced policy record. It refuses unfinished requests,
+omitted recorded request identities, duplicate attempts, or an existing attempt
+policy. The imported count can already exceed the cap; then no new attempt is
+admitted for that execution. The command cannot prove the completeness of the
+operator's review of zero-request attempts. Retain the evidence for inspection.
+
+All original journal bytes, request counts, charges, held reservations, campaign
+identity, dollar limit, concurrency limit and deadline remain intact. Subsequent
+launch manifests must use the adopted cap. The migration cannot extend an expired
+deadline, change an existing cap, or replenish an allowance. An interrupted append
+remains an accounting failure and must be recovered before more paid work.

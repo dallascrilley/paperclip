@@ -18,6 +18,12 @@ export interface EvalChargeIdentity {
   phase: "setup" | "agent" | "judge" | "feedback_review" | "tool" | "infrastructure";
   runId?: string;
 }
+export interface EvalLegacyAttemptAudit {
+  previousJournalHash: string;
+  evidenceSha256: string;
+  maxAttemptsPerExecution: number;
+  priorAttempts: Array<{ executionId: string; attemptId: string }>;
+}
 export interface EvalCostObservation {
   observationId: string;
   requestId: string;
@@ -36,6 +42,7 @@ export interface EvalCostObservation {
 
 type Event =
   | { type: "campaign"; limits: EvalSpendLimits }
+  | ({ type: "attempt_policy" } & EvalLegacyAttemptAudit)
   | { type: "attempt"; executionId: string; attemptId: string }
   | { type: "reserve"; requestId: string; identity: EvalChargeIdentity; maxUsd: string }
   | { type: "observe"; observation: EvalCostObservation }
@@ -60,11 +67,13 @@ const ranks = { unknown: 0, allocated: 1, estimated: 2, reported: 3, reconciled:
 export class EvalAdmissionError extends Error {}
 
 export class EvalSpendState {
+  readonly limits: EvalSpendLimits;
   readonly requests = new Map<string, RequestState>();
   readonly observations = new Map<string, EvalCostObservation>();
   readonly attempts = new Map<string, string>();
   private providerRequests = new Map<string, string>();
-  constructor(readonly limits: EvalSpendLimits) {
+  constructor(limits: EvalSpendLimits) {
+    this.limits = structuredClone(limits);
     fields(limits, ["campaignId", "maxUsd", "deadlineAt", "maxRequests", "maxConcurrent", "maxAttemptsPerExecution"]);
     if (!validId(limits.campaignId) || amount(limits.maxUsd) <= 0n || !Number.isFinite(Date.parse(limits.deadlineAt))
         || !Number.isSafeInteger(limits.maxRequests) || limits.maxRequests < 1
@@ -108,7 +117,23 @@ export class EvalSpendState {
   }
   validate(event: Event, now = Date.now()) {
     if (event.type === "campaign") throw new Error("Duplicate campaign event");
-    if (event.type === "attempt") {
+    if (event.type === "attempt_policy") {
+      fields(event, ["type", "previousJournalHash", "evidenceSha256", "maxAttemptsPerExecution", "priorAttempts"]);
+      if (this.limits.maxAttemptsPerExecution !== undefined || this.attempts.size) throw new Error("Eval attempt policy already established");
+      if (!/^[0-9a-f]{64}$/.test(event.previousJournalHash) || !/^[0-9a-f]{64}$/.test(event.evidenceSha256)
+          || !Number.isSafeInteger(event.maxAttemptsPerExecution) || event.maxAttemptsPerExecution < 1
+          || !Array.isArray(event.priorAttempts)) throw new Error("Invalid legacy attempt audit");
+      const audited = new Map<string, string>();
+      for (const attempt of event.priorAttempts) {
+        fields(attempt, ["executionId", "attemptId"]);
+        if (!validId(attempt.executionId) || !validId(attempt.attemptId) || audited.has(attempt.attemptId)) throw new Error("Invalid legacy attempt identity");
+        audited.set(attempt.attemptId, attempt.executionId);
+      }
+      for (const request of this.requests.values()) {
+        if (!request.finished) throw new Error("Legacy attempt audit requires stopped requests");
+        if (audited.get(request.identity.attemptId) !== request.identity.executionId) throw new Error("Legacy attempt audit omits a recorded request");
+      }
+    } else if (event.type === "attempt") {
       fields(event, ["type", "executionId", "attemptId"]);
       if (!validId(event.executionId) || !validId(event.attemptId) || this.limits.maxAttemptsPerExecution === undefined) throw new Error("Invalid attempt admission");
       if (this.attempts.has(event.attemptId)) throw new EvalAdmissionError("Eval attempt already admitted");
@@ -153,7 +178,10 @@ export class EvalSpendState {
     } else throw new Error("Unknown ledger event");
   }
   apply(event: Event) {
-    if (event.type === "attempt") this.attempts.set(event.attemptId, event.executionId);
+    if (event.type === "attempt_policy") {
+      this.limits.maxAttemptsPerExecution = event.maxAttemptsPerExecution;
+      for (const attempt of event.priorAttempts) this.attempts.set(attempt.attemptId, attempt.executionId);
+    } else if (event.type === "attempt") this.attempts.set(event.attemptId, event.executionId);
     else if (event.type === "reserve") this.requests.set(event.requestId, { identity: event.identity, reserved: amount(event.maxUsd), observations: [], finished: false });
     else if (event.type === "observe") {
       const o = event.observation;
@@ -177,6 +205,7 @@ export async function readEvalCostLedger(file: string) {
       if (line.event.type !== "campaign") throw new Error("Eval ledger lacks campaign limits");
       state = new EvalSpendState(line.event.limits);
     } else {
+      if (line.event.type === "attempt_policy" && line.event.previousJournalHash !== previous) throw new Error("Legacy attempt audit checkpoint changed");
       state!.validate(line.event, Date.parse(line.at));
       state!.apply(line.event);
     }
@@ -217,6 +246,7 @@ export async function openEvalCostLedger(file: string, limits: EvalSpendLimits) 
       const operation = queue.then(async () => {
         if (poisoned) throw new Error("Eval ledger writer unavailable");
         const admittedAt = Date.now();
+        if (event.type === "attempt_policy" && event.previousJournalHash !== previous) throw new Error("Legacy attempt audit checkpoint changed");
         state.validate(event, admittedAt);
         try { await write(event, admittedAt); } catch (error) { poisoned = true; throw error; }
         state.apply(event);
@@ -225,6 +255,7 @@ export async function openEvalCostLedger(file: string, limits: EvalSpendLimits) 
       return operation;
     };
     return {
+      adoptLegacyAttemptPolicy: (audit: EvalLegacyAttemptAudit) => append({ ...structuredClone(audit), type: "attempt_policy" }),
       admitAttempt: (executionId: string, attemptId: string) => append({ type: "attempt", executionId, attemptId }),
       reserve: (requestId: string, identity: EvalChargeIdentity, maxUsd: string) => append({ type: "reserve", requestId, identity: structuredClone(identity), maxUsd }),
       observe: (observation: EvalCostObservation) => append({ type: "observe", observation: structuredClone(observation) }),
