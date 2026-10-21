@@ -48,7 +48,8 @@ export async function probePluginRunnerEnvironment(context: AdapterEnvironmentTe
     probeStarted = true;
     const effort = context.config.modelReasoningEffort ?? context.config.reasoningEffort ?? context.config.effort;
     const result = await probeNativeRunnerEnvironment({ runtimeDirectory: root, provider: profile.provider,
-      model: profile.model, workingDirectory: target.remoteCwd, timeoutMs: 45_000,
+      // Plugin preparation selects the physical workspace; the probe uses its own logical scope.
+      model: profile.model, timeoutMs: 45_000,
       ...(profile.provider === "codex" && typeof effort === "string" && effort ? { reasoningEffort: effort } : {}),
       environment: {},
       transportOptions: {

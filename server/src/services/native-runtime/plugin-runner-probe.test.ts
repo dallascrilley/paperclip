@@ -250,7 +250,7 @@ describe("plugin Runner setup", () => {
         config: { provider: "codex", model: "gpt-6.1-sol", env: ["managed-account", "unsafe-project"].includes(mode)
             ? { OPENAI_API_KEY: "core-secret-not-transferred", CODEX_HOME: accountHome } : {},
           ...(["managed-account", "unsafe-project"].includes(mode) ? { managedAiConnection: { identity: "selected-revision", sessionIdentity: "selected-account" } } : {}) },
-        executionTarget: { kind: "remote", transport: "sandbox", providerKey: "plugin", leaseId: randomUUID(), remoteCwd: "/runner-only/project-does-not-exist-on-core",
+        executionTarget: { kind: "remote", transport: "sandbox", providerKey: "plugin", leaseId: randomUUID(), remoteCwd: ".",
           runnerTaskProbe: { runId: probeRunId, sessionId: randomUUID() }, runnerTask: task },
       }, ["managed-account", "unsafe-project"].includes(mode) ? { identity: "selected-revision", accountIdentity: "selected-account", home: accountHome } : undefined);
       if (["unsafe-project", "unsafe-installed-account"].includes(mode)) {
