@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { summarizeCampaignFeedback } from "./feedback.js";
-import { html } from "./report-format.js";
+import { html, isPublicReportTimestamp } from "./report-format.js";
 import type { RunnerE2ECampaign } from "./types.js";
 
 const dispositions = ["actionable", "duplicate", "already_fixed", "unsupported", "needs_investigation"] as const;
@@ -50,7 +50,7 @@ export function validateCampaignFeedbackReview(campaign: RunnerE2ECampaign, revi
   };
   fields(review, ["version", "campaignId", "evidenceHash", "reviewedAt", "reviewedBy", "decisions"]);
   if (review.version !== 1 || review.campaignId !== campaign.campaignId || review.evidenceHash !== campaignFeedbackEvidence(campaign)
-      || typeof review.reviewedAt !== "string" || !Number.isFinite(Date.parse(review.reviewedAt))
+      || !isPublicReportTimestamp(review.reviewedAt)
       || !["human", "agent"].includes(review.reviewedBy) || !Array.isArray(review.decisions)) fail();
   const groups = summarizeCampaignFeedback(campaign.accounting?.attempts ?? campaign.results).review;
   const expected = new Set(groups.map(group => group.fingerprint)), seen = new Set<string>();

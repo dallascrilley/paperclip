@@ -2553,7 +2553,9 @@ pnpm exec tsx tests/runner-e2e/feedback-dispositions.ts /private/report/normaliz
 ```
 
 Inspect the full bodies in the retained attempt snapshots. Set `reviewedAt` to
-the review time and `reviewedBy` to `human` or `agent`. Assign each fingerprint
+an ISO timestamp with an explicit timezone, such as `2026-10-20T01:00:00Z`,
+and `reviewedBy` to `human` or `agent`. Timestamp comments and free-form dates
+are rejected so private notes cannot enter public report metadata. Assign each fingerprint
 one disposition: `actionable`, `duplicate`, `already_fixed`, `unsupported`, or
 `needs_investigation`. A duplicate must name a non-duplicate fingerprint in the
 same campaign via `duplicateOf`. Optional `issueNumber` links a public

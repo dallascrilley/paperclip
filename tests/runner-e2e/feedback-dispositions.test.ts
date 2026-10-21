@@ -84,6 +84,29 @@ it("requires exactly one closed decision per group and refuses raw notes and dup
   ]) expect(() => validateCampaignFeedbackReview(campaign, changed as never)).toThrow("Invalid or stale");
 });
 
+it.each(["2026-10-20T01:00:00Z", "2026-10-20T01:00:00.936739+00:00", "2026-10-19T20:00:00-05:00"])("accepts explicit ISO review timestamps: %s", reviewedAt => {
+  const campaign = fixture();
+  validateCampaignFeedbackReview(campaign, { ...reviewed(campaign), reviewedAt });
+});
+
+it("rejects private timestamp notes before a review can alter the public report", async () => {
+  const campaign = fixture();
+  const reviewedAt = "Tue, 20 Oct 2026 01:00:00 GMT (Private rationale: customer account was suspended)";
+  expect(Number.isFinite(Date.parse(reviewedAt))).toBe(true);
+  const root = await mkdtemp(path.join(tmpdir(), "feedback-private-timestamp-"));
+  try {
+    const original = JSON.stringify(campaign);
+    await writeFile(path.join(root, "normalized-results.json"), original);
+    const feedbackReviewFile = path.join(root, "review.json");
+    await writeFile(feedbackReviewFile, JSON.stringify({ ...reviewed(campaign), reviewedAt }));
+    await expect(regenerateRunnerDashboard({ bundle: root, historyFile: null, feedbackReviewFile })).rejects.toThrow("Invalid or stale");
+    expect(await readFile(path.join(root, "normalized-results.json"), "utf8")).toBe(original);
+    for (const invalid of ["2026-10-20T01:00:00Z\n", "2026-10-20", "2026-10-20T24:00:00Z"]) {
+      expect(() => validateCampaignFeedbackReview(campaign, { ...reviewed(campaign), reviewedAt: invalid })).toThrow("Invalid or stale");
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 it("records an explicit empty review without implying that uncaptured feedback was absent", () => {
   const campaign = fixture(); campaign.accounting!.attempts[0]!.feedback = emptyFeedbackSummary();
   campaign.feedbackReview = { ...feedbackReviewTemplate(campaign), version: 1, reviewedAt: "2026-10-20T01:00:00Z", reviewedBy: "human", decisions: [] };
