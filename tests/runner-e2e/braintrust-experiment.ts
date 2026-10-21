@@ -1,0 +1,140 @@
+import { createHash } from "node:crypto";
+import { buildCampaignAccounting } from "./attempt-accounting.js";
+import { exportBraintrustAttemptParent, type EvalBraintrustConfig } from "./braintrust.js";
+import { validateCampaignFeedbackReview } from "./feedback-dispositions.js";
+import { validateEvalOperationsReport } from "./operations-report.js";
+import { isPublicReportTimestamp } from "./report-format.js";
+import type { RunnerE2ECampaign, RunnerE2EResult } from "./types.js";
+
+const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+const identifier = (value: unknown): value is string => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(value);
+const count = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0;
+const invalid = (): never => { throw new Error("Invalid retained experiment evidence"); };
+
+function attemptProjection(result: RunnerE2EResult, projectId: string) {
+  if (result.schema !== "paperclip.runner-e2e.result/v2"
+      || ![result.executionId, result.suiteId, result.profileId, result.caseId, result.provider, result.model,
+        result.accountingIdentity?.campaignId, result.accountingIdentity?.attemptId].every(identifier)
+      || !/^[0-9a-f]{64}$/.test(result.suiteDefinitionHash ?? "") || !/^[0-9a-f]{40}$/.test(result.source?.sha ?? "")
+      || !count(result.attempt) || result.attempt < 1 || !count(result.durationMs)
+      || !["passed", "failed"].includes(result.status) || !["passed", "failed", "not_started"].includes(result.cleanup)
+      || !["native", "legacy"].includes(result.runtimeMode) || !["local", "daytona"].includes(result.environmentId)
+      || !isPublicReportTimestamp(result.startedAt) || !isPublicReportTimestamp(result.finishedAt)
+      || Date.parse(result.finishedAt) < Date.parse(result.startedAt)) invalid();
+  const feedback = result.feedback;
+  if (feedback && (![feedback.complaints, feedback.suggestions, feedback.invocations?.failed, feedback.invocations?.unknown].every(count)
+      || !["complete", "partial", "unavailable", "not_started"].includes(feedback.collection)
+      || !["complete", "partial", "unavailable", "not_started"].includes(feedback.invocationCollection))) invalid();
+  const trace = result.tracing;
+  if (trace) {
+    exportBraintrustAttemptParent(trace);
+    if (trace.projectId !== projectId || !["pending", "accepted", "failed"].includes(trace.status)) invalid();
+  }
+  return {
+    input: { execution_id: result.executionId, suite_id: result.suiteId, profile_id: result.profileId,
+      case_id: result.caseId, provider: result.provider, model: result.model, environment: result.environmentId,
+      runtime: result.runtimeMode, source_revision: result.source!.sha, definition_hash: result.suiteDefinitionHash },
+    output: { product: result.status, cleanup: result.cleanup },
+    scores: { product_pass: Number(result.status === "passed"), cleanup_pass: Number(result.cleanup === "passed") },
+    metrics: { start: Date.parse(result.startedAt) / 1000, end: Date.parse(result.finishedAt) / 1000 },
+    metadata: { campaign_id: result.accountingIdentity!.campaignId, attempt_id: result.accountingIdentity!.attemptId,
+      attempt_number: result.attempt, wall_duration_ms: result.durationMs, grader: "tests/runner-e2e/runner.spec.ts",
+      feedback: feedback ? { collection: feedback.collection, invocation_collection: feedback.invocationCollection,
+        complaints: feedback.complaints, suggestions: feedback.suggestions,
+        failed_submissions: feedback.invocations.failed, unresolved_submissions: feedback.invocations.unknown } : null,
+      trace: trace ? { project_id: trace.projectId, root_span_id: trace.traceId, span_id: trace.spanId,
+        export_status: trace.status, indexed_verification: "unverified" } : null },
+    span_attributes: { name: result.executionId, type: "eval" },
+  };
+}
+
+export function buildBraintrustExperiment(projectId: string, campaign: RunnerE2ECampaign, originals: readonly RunnerE2EResult[]) {
+  if (!uuid.test(projectId) || campaign.schema !== "paperclip.runner-e2e.campaign/v2" || !identifier(campaign.campaignId)
+      || campaign.accounting?.scope !== "retained_attempts" || !Array.isArray(campaign.accounting.attempts)
+      || !count(campaign.accounting.missingAttempts) || !Array.isArray(campaign.expected)
+      || campaign.expected.length === 0 || !campaign.expected.every(identifier)
+      || new Set(campaign.expected).size !== campaign.expected.length || !Array.isArray(originals)
+      || originals.length > 10_000 || campaign.accounting.attempts.length === 0) invalid();
+  if (campaign.operations) validateEvalOperationsReport(campaign.operations);
+  if (campaign.feedbackReview) validateCampaignFeedbackReview(campaign, campaign.feedbackReview);
+  const accounting = campaign.accounting!;
+  const operations = campaign.operations?.status !== "unavailable" ? campaign.operations : undefined;
+  if (operations && operations.ledgerCampaignId !== campaign.campaignId) invalid();
+  const candidates = new Map<string, { original: RunnerE2EResult; projection: ReturnType<typeof attemptProjection> }>();
+  for (const original of originals) {
+    const projection = attemptProjection(original, projectId);
+    if (original.accountingIdentity!.campaignId !== campaign.campaignId || !campaign.expected.includes(original.executionId)) invalid();
+    const receipt = buildCampaignAccounting({ results: [original] }).attempts[0]!;
+    const retained = accounting.attempts.find(attempt => attempt.id === receipt.id);
+    if (!retained || JSON.stringify(retained) !== JSON.stringify(receipt)) invalid();
+    const previous = candidates.get(receipt.id);
+    if (previous && digest(previous.projection) !== digest(projection)) invalid();
+    candidates.set(receipt.id, { original, projection });
+  }
+  if (candidates.size !== accounting.attempts.length) invalid();
+  const events = [...candidates.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([id, { original, projection }]) => {
+    const cost = operations?.attempts.find(row => row.executionId === original.executionId && row.attemptId === original.accountingIdentity!.attemptId);
+    return { ...projection, id, span_id: id, root_span_id: id,
+      metadata: { ...projection.metadata, request_ledger: cost ? {
+        known_usd: cost.knownUsd, additional_held_usd: cost.heldUsd, requests: cost.requests,
+        unresolved_requests: cost.unresolvedRequests, journal_hash: operations!.journalHash,
+      } : null } };
+  });
+  const metadata = { importer: "paperclip-retained-attempts-v1", campaign_id: campaign.campaignId,
+    expected_execution_ids: [...campaign.expected].sort(), retained_attempts: events.length,
+    missing_attempts: accounting.missingAttempts,
+    request_ledger: operations ? { journal_hash: operations.journalHash, known_usd: operations.knownUsd,
+      additional_held_usd: operations.heldUsd, committed_usd: operations.committedUsd,
+      requests: operations.requests, unresolved_requests: operations.unresolvedRequests, breakdown: operations.breakdown } : null,
+    feedback_review: campaign.feedbackReview ?? null,
+    accounting_note: "Ledger amounts are separate observations, not additive trace metrics. Held reservations are not charges. Requests outside the gateway and infrastructure require separate accounting." };
+  const payloadHash = digest({ projectId, metadata, events });
+  return { projectId, payloadHash, name: `${campaign.campaignId}-${payloadHash}`, metadata: { ...metadata, payload_hash: payloadHash }, events };
+}
+
+export interface BraintrustExperimentReceipt {
+  version: 1; projectId: string; experimentId: string; name: string; payloadHash: string;
+  status: "created" | "accepted"; acceptedRows: number; expectedRows: number; verification: "unverified";
+}
+
+async function post(config: EvalBraintrustConfig, endpoint: string, payload: unknown, transport: typeof fetch) {
+  const response = await transport(`https://api.braintrust.dev/v1/${endpoint}`, {
+    method: "POST", redirect: "error", signal: AbortSignal.timeout(15_000),
+    headers: { authorization: `Bearer ${config.apiKey}`, "content-type": "application/json" }, body: JSON.stringify(payload),
+  });
+  const reader = response.body?.getReader(), chunks: Uint8Array[] = []; let size = 0;
+  try {
+    if (!response.ok) throw new Error("rejected");
+    while (reader) {
+      const next = await reader.read(); if (next.done) break;
+      size += next.value.length; if (size > 1_048_576) throw new Error("oversized");
+      chunks.push(next.value);
+    }
+    return JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+  } finally { await reader?.cancel().catch(() => {}); }
+}
+
+export async function importBraintrustExperiment(config: EvalBraintrustConfig, campaign: RunnerE2ECampaign,
+  originals: readonly RunnerE2EResult[], persist: (receipt: BraintrustExperimentReceipt) => Promise<void>, transport: typeof fetch = fetch) {
+  const plan = buildBraintrustExperiment(config.projectId, campaign, originals);
+  if (!config.apiKey?.trim() || /[\r\n]/.test(config.apiKey)) throw new Error("Missing Braintrust ingestion credential");
+  try {
+    const created = await post(config, "experiment", { project_id: plan.projectId, name: plan.name,
+      public: false, ensure_new: false, metadata: plan.metadata }, transport);
+    if (!uuid.test(String(created?.id)) || created.project_id !== plan.projectId || created.name !== plan.name || created.public !== false
+        || (created.metadata as Record<string, unknown> | undefined)?.payload_hash !== plan.payloadHash) throw new Error("conflicting_experiment");
+    const receipt: BraintrustExperimentReceipt = { version: 1, projectId: plan.projectId, experimentId: String(created.id),
+      name: plan.name, payloadHash: plan.payloadHash, status: "created", acceptedRows: 0, expectedRows: plan.events.length, verification: "unverified" };
+    await persist({ ...receipt });
+    for (let offset = 0; offset < plan.events.length; offset += 100) {
+      const events = plan.events.slice(offset, offset + 100);
+      const inserted = await post(config, `experiment/${receipt.experimentId}/insert`, { events }, transport);
+      if (!Array.isArray(inserted?.row_ids) || JSON.stringify([...inserted.row_ids].sort()) !== JSON.stringify(events.map(event => event.id).sort())) throw new Error("missing_rows");
+      receipt.acceptedRows += events.length;
+      if (receipt.acceptedRows === receipt.expectedRows) receipt.status = "accepted";
+      await persist({ ...receipt });
+    }
+    return receipt;
+  } catch { throw new Error("Braintrust experiment import incomplete; retain the receipt and retry identical evidence. Remote details withheld."); }
+}

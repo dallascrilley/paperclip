@@ -107,6 +107,40 @@ Gateway and native tracing are separate opt-ins; see the README tracing section.
 
 ## Inspection and limits
 
+Retained deterministic grades can be imported into a private Braintrust experiment
+without invoking agents or judges. Prepare a JSON array of absolute paths to the
+original `result.json` for **every** retained attempt in `normalized-results.json`.
+The original files supply each attempt's actual source and definition hash;
+the selected result's revision must not be assigned to older attempts.
+
+```sh
+PAPERCLIP_E2E_BRAINTRUST_PROJECT_ID=PROJECT_UUID \
+pnpm exec tsx tests/runner-e2e/braintrust-experiment-import.ts \
+  /private/campaign/normalized-results.json /private/campaign/original-result-paths.json \
+  /private/campaign/experiment-plan.json --dry-run
+```
+
+Inspect the plan. To import it, provide `BRAINTRUST_API_KEY` securely, remove
+`--dry-run`, and use a separate `experiment-receipt.json` output path. The importer
+requires explicit accounting identities and source/definition hashes; older
+incomplete provenance fails closed. It retains original failed and successful
+grades, cleanup outcomes, feedback counts, source revisions and trace identities.
+It does not upload prompts, feedback bodies, matcher details or raw errors.
+
+The evidence digest determines the private experiment name. Identical evidence
+reuses that experiment and stable row IDs after an interrupted insert. Changed
+evidence creates a different experiment. The receipt checkpoints accepted batches;
+HTTP acceptance still requires independent indexing/UI verification. Retain failed
+receipts. A retry must use the same original evidence, not newly run agents.
+
+Request-ledger amounts remain metadata with their journal hash and classifications.
+They are not additive cost metrics, and missing rows remain unknown rather than
+zero. The campaign ledger may include setup probes outside the imported tests.
+Do not add experiment metadata amounts to native or gateway trace costs. Native
+trace rollups are not invoice reconciliation and can omit setup or duplicate logs.
+API contracts: [create experiment](https://www.braintrust.dev/docs/api-reference/experiments/create-experiment)
+and [insert retained events](https://www.braintrust.dev/docs/api-reference/experiments/insert-experiment-events).
+
 - `operations-preflight.json` preserves the exact manifest in the campaign folder.
 - `ledger.jsonl` is the append-only authority for request admission and observations.
 - `ledger.jsonl.requests/` contains private per-request checkpoints.
