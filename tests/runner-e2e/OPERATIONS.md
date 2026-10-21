@@ -185,7 +185,7 @@ Create a private JSON audit with these fields:
 - `maxAttemptsPerExecution`: the finite cap to adopt, including past attempts.
 - `priorAttempts`: an array of `{ "executionId": "...", "attemptId": "..." }`.
 
-Run `pnpm exec tsx tests/runner-e2e/ledger-attempt-policy.ts /absolute/private-audit.json`.
+Run `node cli/node_modules/tsx/dist/cli.mjs tests/runner-e2e/ledger-attempt-policy.ts /absolute/private-audit.json`.
 The command checks evidence and journal hashes, takes the normal exclusive writer
 lock, and appends one fsynced policy record. It refuses unfinished requests,
 omitted recorded request identities, duplicate attempts, or an existing attempt
