@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { expectedFixtureFeedback, gradeFeedbackPersistence } from "./feedback-persistence.js";
-import { runnerMatrix } from "./catalog.js";
+import { expectedFixtureFeedback, feedbackPersistenceDigest, gradeFeedbackPersistence } from "./feedback-persistence.js";
+import { runnerMatrix, runnerTasks, suiteDefinitionHash } from "./catalog.js";
 import { parseRunnerSelectors, selectRunnerExecutions } from "./selectors.js";
 
 function fixture() {
@@ -15,6 +15,20 @@ function fixture() {
 }
 
 describe("feedback persistence oracle", () => {
+  it("changes the suite hash when the inherited prompt or matchers change", () => {
+    const base = runnerTasks.find(task => task.id === "message-marker")!;
+    const suite = runnerMatrix.find(execution => execution.suite.id === "feedback-persistence")!.suite;
+    const baseline = suiteDefinitionHash(suite);
+    expect(suite.definitionMetadata?.sourceDigest).toBe(feedbackPersistenceDigest(base));
+    for (const changed of [
+      { ...base, buildPrompt: () => "A different completion contract" },
+      { ...base, buildMatchers: () => [] },
+    ]) {
+      expect(suiteDefinitionHash({ ...suite, definitionMetadata: {
+        ...suite.definitionMetadata, sourceDigest: feedbackPersistenceDigest(changed),
+      } })).not.toBe(baseline);
+    }
+  });
   it("accepts independently retained bodies with same-run real tool receipts", () => {
     expect(gradeFeedbackPersistence(fixture()).every(check => check.passed)).toBe(true);
   });

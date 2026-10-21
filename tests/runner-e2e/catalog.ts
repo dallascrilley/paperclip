@@ -1590,7 +1590,7 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     profiles: runnerProfiles.filter(profile => ["runner-codex", "runner-acpx-claude"].includes(profile.id)),
     environments: [localEnvironment], tasks: [feedbackPersistenceTask(runnerTasks.find(task => task.id === "message-marker")!)], expectedMatrixSize: 2,
     definitionMetadata: { version: 1, owner: "runner-e2e-maintainers", scheduling: "explicit-only",
-      sourceDigest: feedbackPersistenceDigest, expectedWorkRuns: 1, automaticRetryPolicy: "single_attempt",
+      sourceDigest: feedbackPersistenceDigest(runnerTasks.find(task => task.id === "message-marker")!), expectedWorkRuns: 1, automaticRetryPolicy: "single_attempt",
       budgetCents: 1_000, forecast: "unmeasured; gateway manifest required for bounded qualification",
       grading: "retained-exact-bodies-and-run-attributed-completed-tools", feedback: "synthetic-disposable-items" },
   },

@@ -3,11 +3,18 @@ import { readFileSync } from "node:fs";
 import type { RunnerTaskFixture } from "./types.js";
 
 export const FEEDBACK_PERSISTENCE_SUITE = "feedback-persistence";
-export const feedbackPersistenceDigest = createHash("sha256")
+const feedbackPersistenceSourceDigest = createHash("sha256")
   .update(readFileSync(new URL(import.meta.url)))
+  .update(readFileSync(new URL("./catalog.ts", import.meta.url)))
   .update(readFileSync(new URL("./feedback.ts", import.meta.url)))
   .update(readFileSync(new URL("./runner.spec.ts", import.meta.url)))
   .digest("hex");
+
+export function feedbackPersistenceDigest(base: RunnerTaskFixture) {
+  return createHash("sha256").update(feedbackPersistenceSourceDigest)
+    .update(JSON.stringify(base, (_key, value) => typeof value === "function" ? value.toString() : value))
+    .digest("hex");
+}
 
 export function expectedFixtureFeedback(nonce: string) {
   return {
