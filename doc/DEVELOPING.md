@@ -3146,8 +3146,11 @@ including when delivery history remains in the database.
 The scanner preserves durable delivery receipts instead of advancing a timestamp
 cursor that could skip a late commit. Subscription scans use pages of 20; full source/delivery batches schedule another
 sweep until caught up. Subscription creation, refresh, and removal target their
-subscription ID (or the shared Dot binding for reconnect mailbox entries). Delivery retries do not rescan unchanged subscriptions. Broad
-source-change notifications retain an explicit wildcard when a transaction also
+subscription ID (or the shared Dot binding for reconnect mailbox entries). Issue
+activity targets its task; comment discovery targets its company; mailbox and
+assignment changes target their Dot binding. Delivery retries do not rescan
+unchanged subscriptions. Only startup and instance-wide settings changes request
+a full scan. Settings changes retain an explicit wildcard when a transaction also
 contains scoped hints. A fresh request or failed sweep survives warm standby and
 idle drain; skipped dispatch never marks it complete. Shutdown stops admission of
 new batches and waits for the current bounded webhook attempt to settle.

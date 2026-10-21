@@ -52,7 +52,8 @@ describe.skipIf(!support.supported)("MCP event committed work", () => {
   });
   afterAll(async () => { await db?.$client.end({ timeout: 1 }); await temporary?.cleanup(); vi.unstubAllEnvs(); });
 
-  async function fixture(dot = false) {
+  async function fixture(dot = false, scope = { companyId, taskId }) {
+    const { companyId, taskId } = scope;
     const config = { origin: "https://paperclip.example", resource: `https://paperclip.example/mcp/${dot ? "runner" : "paperclip"}` };
     const clientId = randomUUID();
     await db.insert(mcpOauthClients).values({ id: clientId, name: "Sleep fixture", redirectUris: ["https://receiver.example/oauth"] });
@@ -197,6 +198,26 @@ describe.skipIf(!support.supported)("MCP event committed work", () => {
     await db.update(mcpEventSubscriptions).set({ scannedAt: untouched });
     status = 204; await vi.advanceTimersByTimeAsync(4_000); await delivered(4);
     expect((await db.select().from(mcpEventSubscriptions)).every(s => s.scannedAt.getTime() === 0)).toBe(true);
+    await quiet();
+  });
+
+  it.each([false, true])("keeps tenant content wakes scoped with Dot=%s", async dot => {
+    const first = await fixture(dot); const firstSubscription = await first.subscribe();
+    const other = { companyId: randomUUID(), taskId: randomUUID() };
+    await db.insert(companies).values({ id: other.companyId, name: "Other tenant", issuePrefix: "OTHER" });
+    await db.insert(companyMemberships).values({ companyId: other.companyId, principalId: userId, principalType: "user", membershipRole: "owner", status: "active" });
+    await db.insert(issues).values({ id: other.taskId, companyId: other.companyId, title: "Other task" });
+    const second = await fixture(dot, other); const secondSubscription = await second.subscribe(); await second.start();
+    if (dot) await delivered(2);
+    await db.update(mcpEventSubscriptions).set({ scannedAt: new Date(0) });
+    if (dot) await insertIssueComment(db, { companyId, issueId: taskId, authorUserId: userId, body: "Tenant-local comment" });
+    else await activity();
+    await vi.waitFor(async () => {
+      const subscriptions = await db.select().from(mcpEventSubscriptions);
+      expect(subscriptions.find(s => s.id === firstSubscription.id)?.scannedAt.getTime()).toBeGreaterThan(0);
+      expect(subscriptions.find(s => s.id === secondSubscription.id)?.scannedAt.getTime()).toBe(0);
+    });
+    if (!dot) await delivered(1);
     await quiet();
   });
 

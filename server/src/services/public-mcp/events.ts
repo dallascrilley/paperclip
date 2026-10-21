@@ -359,8 +359,10 @@ export function createPublicMcpEvents(db: Db, oauth: PublicMcpOAuth, api: ApiDis
         options.enableDotRunner ? isNotNull(subscriptions.bindingId) : isNotNull(subscriptions.taskId),
         scan.after ? gt(subscriptions.id, scan.after) : undefined,
         scan.ids ? or(
-          inArray(subscriptions.id, scan.ids.filter(id => !id.startsWith("binding:"))),
+          inArray(subscriptions.id, scan.ids.filter(id => !id.includes(":"))),
           inArray(subscriptions.bindingId, scan.ids.filter(id => id.startsWith("binding:")).map(id => id.slice(8))),
+          inArray(subscriptions.taskId, scan.ids.filter(id => id.startsWith("task:")).map(id => id.slice(5))),
+          inArray(subscriptions.companyId, scan.ids.filter(id => id.startsWith("company:")).map(id => id.slice(8))),
         ) : undefined)).orderBy(asc(subscriptions.id)).limit(20);
       for (const s of active) {
         if (stopped || options.isBackgroundWorkEnabled?.() === false) return;

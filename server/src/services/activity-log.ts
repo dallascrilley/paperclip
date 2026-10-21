@@ -179,7 +179,7 @@ export async function persistActivity(db: Db, input: LogActivityInput) {
   }).returning({ id: activityLog.id });
   const [activity] = input.entityType === "issue"
     ? await db.transaction(async tx => {
-      await notifyDeliveryWork(tx, DELIVERY_QUEUES.mcpEvents, "*");
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.mcpEvents, `task:${input.entityId}`);
       return insert(tx as unknown as Db);
     })
     : await insert(db);
