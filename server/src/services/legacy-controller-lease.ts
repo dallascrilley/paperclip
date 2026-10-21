@@ -171,8 +171,12 @@ export function watchLegacyControllerLease(
       onAbort = () => reject(controller.signal.reason);
       controller.signal.addEventListener("abort", onAbort, { once: true });
     });
+    // The successful attempt's UPDATE writes a fresh lease, so the local
+    // deadline is measured from that attempt rather than the first one.
+    let attemptStartedAt = startedAt;
     const renew = async () => {
       for (;;) {
+        attemptStartedAt = Date.now();
         try {
           return await renewOnLivenessPool(db, run, stage, renewalStatementTimeoutMs);
         } catch (error) {
@@ -196,7 +200,7 @@ export function watchLegacyControllerLease(
     if (!stopped) {
       lastRenewedAt = Date.now();
       renewalCount += 1;
-      armDeadline(Math.max(0, LEGACY_CONTROLLER_LEASE_MS - (Date.now() - startedAt)));
+      armDeadline(Math.max(0, LEGACY_CONTROLLER_LEASE_MS - (Date.now() - attemptStartedAt)));
     }
   };
   const timer = setInterval(() => {

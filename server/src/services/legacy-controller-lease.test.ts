@@ -233,6 +233,31 @@ describe("legacy controller lease loss attribution", () => {
     } finally { watch.stop(); vi.useRealTimers(); }
   });
 
+  it("measures the next deadline from the retry that renewed the lease", async () => {
+    const timeoutAfterMs = 45_000;
+    let calls = 0;
+    const retryingDb = fakeRenewalDb(() => {
+      calls += 1;
+      if (calls === 1) {
+        return new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error("statement timeout"), { code: "57014" })), timeoutAfterMs));
+      }
+      return calls === 2 ? Promise.resolve([{ id: "run" }]) : new Promise(() => {});
+    });
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const watch = watchLegacyControllerLease(retryingDb, watchedRun(LEGACY_CONTROLLER_LEASE_MS), controller);
+    try {
+      await vi.advanceTimersByTimeAsync(LEGACY_CONTROLLER_RENEW_MS + timeoutAfterMs);
+      expect(calls).toBe(2);
+      // The retry wrote a fresh 60s lease; the first attempt's start must not shorten it.
+      await vi.advanceTimersByTimeAsync(LEGACY_CONTROLLER_LEASE_MS - 1);
+      expect(controller.signal.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(2);
+      expect(controller.signal.reason.leaseLossCause).toBe("renewal_deadline");
+      expect(controller.signal.reason.leaseLossTiming).toMatchObject({ sinceRenewalMs: LEGACY_CONTROLLER_LEASE_MS, renewalCount: 1 });
+    } finally { watch.stop(); vi.useRealTimers(); }
+  });
+
   it("records how late the deadline ran when the event loop was blocked", async () => {
     const idleDb = fakeRenewalDb(() => new Promise(() => {}));
     const controller = new AbortController();
