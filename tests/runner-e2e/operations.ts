@@ -42,7 +42,7 @@ export function validateEvalOperationsManifest(value: EvalOperationsManifest, ex
     evalRequestReservation({ ...model, mode: value.route, apiKey: "validation" });
   }
   for (const execution of executions) {
-    if (execution.environment.id !== "local" || execution.suite.id !== "core-compatibility"
+    if (execution.environment.id !== "local" || !["core-compatibility", "feedback-persistence"].includes(execution.suite.id)
         || !["runner-codex", "runner-acpx-claude", "legacy-codex", "legacy-claude"].includes(execution.profile.id)
         || execution.requiredCredentials.length !== 1) throw new Error(`Unqualified budgeted eval route: ${execution.id}`);
     const provider = execution.profile.credential === "ANTHROPIC_API_KEY" ? "anthropic" : "openai";

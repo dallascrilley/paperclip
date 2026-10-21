@@ -1,3 +1,4 @@
+import { FEEDBACK_PERSISTENCE_SUITE, gradeFeedbackPersistence } from "./feedback-persistence.js";
 import { EvalAttemptTrace, evalBraintrustConfig, EVAL_OBSERVABILITY_SECRET_NAMES } from "./braintrust.js";
 import { runCaseHandoffsFlow } from "./case-handoffs-flow.js";
 import { runCaseReceiptFlow } from "./case-receipt-flow.js";
@@ -3185,6 +3186,16 @@ for (const execution of executions) {
           primaryError = new AggregateError([primaryError, ...verification.errors].filter(Boolean), "Cleanup verification failed after provider settlement");
           if (failureClassOverride !== "secret_leak") failureClassOverride = "cleanup_failure";
         }
+      }
+
+      if (execution.suite.id === FEEDBACK_PERSISTENCE_SUITE) {
+        let evidence: unknown;
+        try { evidence = JSON.parse(await readFile(path.join(snapshotsDir, "agent-feedback.json"), "utf8")); } catch { evidence = undefined; }
+        const checks = gradeFeedbackPersistence({ evidence, nonce, companyId: fixtures?.company.id,
+          agentId: fixtures?.agent.id, taskId: issue?.id, runIds: selectedRuns.map(run => run.id) });
+        matcherResults.push(...checks.map(check => ({ matcher: { kind: "json_path" as const,
+          path: `feedbackPersistence.${check.id}`, expected: true }, passed: check.passed, detail: check.detail })));
+        if (checks.some(check => !check.passed)) primaryError ??= new Error("Feedback persistence matcher failed");
       }
 
       const traceReceipt = await trace?.export({ failed: Boolean(primaryError), runIds: selectedRuns.map(run => run.id),

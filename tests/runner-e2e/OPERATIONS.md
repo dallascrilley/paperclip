@@ -198,3 +198,9 @@ identity, dollar limit, concurrency limit and deadline remain intact. Subsequent
 launch manifests must use the adopted cap. The migration cannot extend an expired
 deadline, change an existing cap, or replenish an allowance. An interrupted append
 remains an accounting failure and must be recovered before more paid work.
+
+The explicit local `feedback-persistence` native Claude/Codex cells also accept
+an operations manifest. They use the same metered connection, prices, campaign
+journal, setup boundary, and durable attempt allowance as core compatibility.
+Collection and the independent saved-evidence oracle require no additional
+model call. The synthetic items need review as test data, not product incidents.

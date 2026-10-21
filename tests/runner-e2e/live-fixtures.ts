@@ -171,7 +171,7 @@ export async function setupLiveFixtures(input: {
           : ["native-completion", "native-instruction-consolidation", "native-connection-guidance"].includes(execution.suite.id)
           || (execution.suite.id === "everyday-workflows" && ["hire-reuse", "delegate-feedback"].includes(execution.task.id)) ? NATIVE_COMPLETION_BUDGET_CENTS
           : execution.suite.id === "task-titles" ? TASK_TITLE_BUDGET_CENTS
-          : ["stock-harness", "task-workspaces", "case-handoffs"].includes(execution.suite.id) ? 1_000 : 0,
+          : ["stock-harness", "task-workspaces", "case-handoffs", "feedback-persistence"].includes(execution.suite.id) ? 1_000 : 0,
       });
       await input.onCompanyCreated?.(company.id);
       return company;
@@ -279,7 +279,7 @@ export async function setupLiveFixtures(input: {
   const gatewayToken = process.env.PAPERCLIP_E2E_GATEWAY_TOKEN;
   const budgetedGateway = Boolean(gatewayUrl || gatewayToken);
   if (budgetedGateway && (!gatewayUrl || !gatewayToken || !/^http:\/\/127\.0\.0\.1:[0-9]+$/.test(gatewayUrl)
-      || execution.environment.id !== "local" || execution.suite.id !== "core-compatibility")) throw new Error("Unqualified fixture gateway route");
+      || execution.environment.id !== "local" || !["core-compatibility", "feedback-persistence"].includes(execution.suite.id))) throw new Error("Unqualified fixture gateway route");
   if (managedHiring || savedCopilot || budgetedGateway) {
     registry.register<ManagedAccountFixture>({
       id: "ai-connection",
@@ -365,7 +365,7 @@ export async function setupLiveFixtures(input: {
           setupProbe.defaultRunner = selected.defaultRunner;
         }
       }
-      if (["stock-harness", "native-connection-guidance"].includes(execution.suite.id)
+      if (["stock-harness", "native-connection-guidance", "feedback-persistence"].includes(execution.suite.id)
         || (execution.suite.id === "everyday-workflows" && ["hire-reuse", "delegate-feedback"].includes(execution.task.id))) {
         agent.budgetMonthlyCents = 1_000;
       }

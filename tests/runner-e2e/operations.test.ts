@@ -57,19 +57,35 @@ it("retains a campaign summary and refuses changing its budget on restart", asyn
     await expect(openEvalOperations(file, [cell], 0, { OPENAI_API_KEY: "private-fixture" })).rejects.toThrow("limits changed");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
-it("routes the fixture through a real shared connection contract without ambient provider bindings", async () => {
+it.each([
+  cell.id,
+  "feedback-persistence.runner-codex.local.complaint-and-suggestion",
+  "feedback-persistence.runner-acpx-claude.local.complaint-and-suggestion",
+])("routes %s through a shared connection without ambient provider bindings", async executionId => {
+  const selected = runnerMatrix.find(execution => execution.id === executionId)!;
+  const anthropic = selected.profile.credential === "ANTHROPIC_API_KEY";
+  const admitted = manifest(); admitted.executionIds = [selected.id];
+  admitted.models[0]!.provider = anthropic ? "anthropic" : "openai";
+  admitted.models[0]!.price.provider = admitted.models[0]!.provider;
+  admitted.models[0]!.price.model = selected.profile.model;
+  if (anthropic) Object.assign(admitted.models[0]!.price, { cacheWrite5mUsdPerMillion: "2", cacheWrite1hUsdPerMillion: "2" });
+  expect(validateEvalOperationsManifest(admitted, [selected], 0)).toBe(admitted);
   vi.stubEnv("PAPERCLIP_E2E_GATEWAY_BASE_URL", "http://127.0.0.1:43123");
   vi.stubEnv("PAPERCLIP_E2E_GATEWAY_TOKEN", "ephemeral-fixture-token");
   const id = "11111111-1111-4111-8111-111111111111", grantId = "22222222-2222-4222-8222-222222222222";
-  let connection: unknown, agent: Record<string, any> | undefined;
+  let connection: unknown, agent: Record<string, any> | undefined, company: Record<string, unknown> | undefined;
   const api = {
     async get() { return [{ id, driver: "local" }]; },
     async postSensitive(url: string, body: unknown) { if (url.endsWith("/ai-connections")) { connection = body; return { connectionId: id, grantId }; } return { id }; },
-    async post(url: string, body: Record<string, unknown>) { if (url.endsWith("/agents")) agent = body; return { id, name: "fixture" }; },
+    async post(url: string, body: Record<string, unknown>) { if (url.endsWith("/agents")) agent = body; if (url === "/api/companies") company = body; return { id, name: "fixture" }; },
   } as unknown as RunnerApi;
-  const fixtures = await setupLiveFixtures({ api, execution: cell, executionNonce: "fixture", workspacePath: "/tmp/fixture", credentials: { OPENAI_API_KEY: "ephemeral-fixture-token" } });
+  const fixtures = await setupLiveFixtures({ api, execution: selected, executionNonce: "fixture", workspacePath: "/tmp/fixture", credentials: { [selected.profile.credential]: "ephemeral-fixture-token" } });
   await fixtures.teardown();
-  expect(createAiConnectionSchema.parse(connection)).toMatchObject({ ownership: "shared", apiKey: "ephemeral-fixture-token", routing: { kind: "gateway", protocol: "responses", baseUrl: "http://127.0.0.1:43123/v1", auth: "bearer" } });
-  expect(aiConnectionBindingSchema.parse(agent!.runtimeConfig.aiConnection)).toEqual({ provider: "openai", method: "api_key", mode: "shared", connectionId: id, grantId });
+  expect(createAiConnectionSchema.parse(connection)).toMatchObject({ ownership: "shared", apiKey: "ephemeral-fixture-token", routing: { kind: "gateway", protocol: anthropic ? "messages" : "responses", baseUrl: `http://127.0.0.1:43123${anthropic ? "" : "/v1"}`, auth: "bearer" } });
+  expect(aiConnectionBindingSchema.parse(agent!.runtimeConfig.aiConnection)).toEqual({ provider: anthropic ? "anthropic" : "openai", method: "api_key", mode: "shared", connectionId: id, grantId });
   expect(agent!.adapterConfig.env).toBeUndefined();
+  if (selected.suite.id === "feedback-persistence") {
+    expect(company!.budgetMonthlyCents).toBe(1_000);
+    expect(agent!.budgetMonthlyCents).toBe(1_000);
+  }
 });
