@@ -158,7 +158,10 @@ export async function forwardEvalRequest(input: {
         await input.onChunk(next.value, signal);
       }
       if (stream) stream.push(new Uint8Array(), true);
-      else if (size) usage.observe(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      else if (size) {
+        try { usage.observe(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }
+        catch (error) { if (response.ok) throw error; }
+      }
     } finally { await reader?.cancel().catch(() => {}); }
     receipt.outcome = response.ok ? "succeeded" : "failed";
     if (!response.ok) receipt.errorCode = "upstream_rejected";

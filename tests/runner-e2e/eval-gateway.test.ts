@@ -98,6 +98,33 @@ it("uses the loopback gateway through real HTTP while withholding upstream crede
   expect(accepted.headers.get("x-paperclip-eval-request-id")).toBeTruthy();
   expect([...accepted.headers.values()].join(" ")).not.toContain(route.apiKey);
 });
+it.each([
+  { status: 400, type: "text/plain", body: "private fixture rejection" },
+  { status: 503, type: "text/html", body: "<html>private fixture rejection</html>" },
+  { status: 400, type: "application/json", body: "invalid JSON fixture rejection" },
+])("finishes non-JSON upstream errors without truncating the client response: $status $type", async error => {
+  const f = await fixture();
+  const transport = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(error.body, { status: error.status, headers: { "content-type": error.type } }))
+    .mockImplementation(async () => response());
+  const gateway = await startEvalGateway({ ...f, transport }); closes.push(() => gateway.close());
+  const request = () => fetch(`${gateway.baseUrl}/responses`, { method: "POST", headers: { authorization: `Bearer ${gateway.token}` }, body: JSON.stringify(f.payload) });
+  const rejected = await request();
+  expect(rejected.status).toBe(error.status);
+  expect(await rejected.text()).toBe(error.body);
+  expect(f.receipts.at(-1)).toMatchObject({ outcome: "failed", errorCode: "upstream_rejected", costUsd: null, usageComplete: false });
+  expect(f.ledger.snapshot()).toMatchObject({ heldUsd: "0.003000000", unknownRequests: 1, inflight: 0 });
+  expect(JSON.stringify(f.receipts)).not.toContain(error.body);
+  expect(await (await request()).json()).toEqual(usage);
+  expect(transport).toHaveBeenCalledTimes(2);
+});
+it("still fails successful responses with invalid usage JSON and holds their reservation", async () => {
+  const f = await fixture();
+  const result = await forwardEvalRequest({ ...f, transport: async () => new Response("invalid successful response", {
+    headers: { "content-type": "application/json", "x-bt-used-endpoint": "OPENAI_API_KEY" },
+  }) });
+  expect(result).toMatchObject({ outcome: "failed", errorCode: "request_failed", costUsd: null });
+  expect(f.ledger.snapshot()).toMatchObject({ heldUsd: "0.003000000", unknownRequests: 1, inflight: 0 });
+});
 
 it("reserves the highest cache-write and long-context rates before dispatch", () => {
   expect(evalRequestReservation({ ...route, price: { ...route.price, cacheWrite12hUsdPerMillion: "5",
