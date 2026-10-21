@@ -415,3 +415,29 @@ limits, case/task state and correlated receipt checks enter workflow evidence.
 Two passive seed cases support browser list assertions; screenshots remain on
 the exact primary case/task routes and document dialogs preserve that case URL.
 The public screenshot allowlist is unchanged.
+
+## Eval feedback capture
+
+`snapshots/agent-feedback.json` retains company-wide complaint/suggestion bodies
+and attributed invocation outcomes in the access-controlled Actions artifact.
+It passes the existing credential scanner and is excluded from public history
+like other snapshots. Normalized results and campaign attempt receipts contain
+only numeric counts, closed collection statuses, and SHA-256 fingerprints for
+review grouping. Public reports never copy feedback bodies, previews, tool
+arguments, or free-form collection errors. Collecting feedback performs no new
+model call and does not forward it to an external service.
+
+Feedback capture retains at most 1,000 full entries and 8 MiB of serialized
+entries/invocations per attempt. Event inspection stops at 10,000 events or
+16 MiB of serialized event data. Limits produce partial collection and a closed
+`evidence_limit_reached` diagnostic; omitted evidence is never reported as absent.
+Checkpoints are considered every ten details, at page boundaries, and at stage
+completion; geometric data growth bounds repeated writes. Reads stop before the
+overall deadline, reserving up to five seconds (20% of shorter windows) to persist
+the collected prefix. Persistence shares the overall collection deadline and
+receives an abort signal. The fixture writes an abortable temporary
+snapshot before replacing the last complete checkpoint, so a stalled write does
+not overwrite earlier evidence with a partially written JSON file.
+Review counts and fingerprints advance only after a checkpoint succeeds. A later
+write failure or expired deadline retains the last saved bodies and marks coverage
+incomplete.

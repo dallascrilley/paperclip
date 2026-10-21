@@ -333,6 +333,7 @@ export interface RunnerE2EResult {
   usage?: Record<string, unknown> | null;
   runtimeUsage?: RunnerE2ERuntimeUsage;
   billing?: RunnerE2EBillingSummary;
+  feedback?: import("./feedback.js").FeedbackSummary;
   matcherResults?: Array<{
     matcher: Matcher;
     passed: boolean;
@@ -404,6 +405,7 @@ export interface RunnerE2EAttemptReceipt {
   status: RunnerE2EResult["status"];
   cleanup: RunnerE2EResult["cleanup"];
   billing: RunnerE2EBillingSummary;
+  feedback?: import("./feedback.js").FeedbackSummary;
 }
 
 export interface RunnerE2ECampaignAccounting {
